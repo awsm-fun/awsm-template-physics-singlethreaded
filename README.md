@@ -1,5 +1,5 @@
 # AWSM Template
-## Spatial audio and single-threaded physics w/ Box3D
+## Spatial audio and single-threaded physics with Box3D
 
 ## **▶ [Live site](https://awsm.fun/experiments/box3d-singlethreaded)**
 _the same build also deploys to GitHub Pages on every merge to `main`._
