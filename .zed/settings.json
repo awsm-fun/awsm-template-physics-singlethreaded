@@ -1,0 +1,21 @@
+// Zed project settings: point rust-analyzer at the wasm target (the only one
+// this workspace builds for). The build flags it needs — the two dep cfgs and
+// `+simd128` — live in .cargo/config.toml and apply automatically, so there's
+// nothing to repeat here (single-threaded: no atomics, no `-Z build-std`, no
+// env RUSTFLAGS). The toolchain (stable) comes from rust-toolchain.toml.
+{
+  "lsp": {
+    "rust-analyzer": {
+      "initialization_options": {
+        "cargo": {
+          "target": "wasm32-unknown-unknown",
+          "allTargets": false,
+          // Keep rust-analyzer's artifacts in target/rust-analyzer so its
+          // background checks don't fight `task dev` builds for the
+          // build-dir lock.
+          "targetDir": true
+        }
+      }
+    }
+  }
+}

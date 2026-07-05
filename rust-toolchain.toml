@@ -1,0 +1,6 @@
+# Single-threaded wasm builds on **stable** Rust — no `-Z build-std`, no atomics,
+# no nightly features. Just the wasm target. (A shared-memory threaded build
+# would need nightly + rust-src to recompile std with atomics; this one doesn't.)
+[toolchain]
+channel = "stable"
+targets = ["wasm32-unknown-unknown"]

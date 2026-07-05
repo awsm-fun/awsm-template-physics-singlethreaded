@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    # Status-check name matches the sibling awsm repos.
+    name: test-ci
+    runs-on: ubuntu-latest
+    steps:
+      # vendor/box3d is a git submodule — box3d-sys compiles it into the bundle.
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      # Stable: this is a plain single-threaded wasm build (no `-Z build-std`,
+      # no atomics — see rust-toolchain.toml). rustfmt + clippy + the wasm
+      # target cover the lint gate. Ubuntu's stock clang has the wasm backend,
+      # so box3d-sys builds as-is.
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+
+      # `task lint` runs clippy for the wasm target.
+      - name: Install Task
+        uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "single-player-game-physics"
+          cache-on-failure: true
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      # Native Box3D build + FFI struct-layout assertions + falling-sphere
+      # smoke tests (serial AND internal-pthread-scheduler configs).
+      - name: Test box3d-sys (host)
+        run: cargo test -p box3d-sys
+
+      - name: Lint (clippy, wasm)
+        run: task lint

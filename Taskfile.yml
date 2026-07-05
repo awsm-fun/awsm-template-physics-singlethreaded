@@ -1,0 +1,115 @@
+version: "3"
+
+silent: true
+
+vars:
+  PORT: "9000"
+  # Dev media server (see `media-dev`): the repo's media/ served OUTSIDE Trunk
+  # so editor exports don't trigger a rebuild/reload storm.
+  PORT_MEDIA: "9001"
+
+# Single-threaded: plain stable-Rust wasm. There's NO special RUSTFLAGS here —
+# the wasm build flags (the two dep cfgs + `+simd128`) live in .cargo/config.toml
+# and apply to every build, so nothing to repeat or keep in sync. No `-Z
+# build-std`, no atomics/shared-memory link args, no COOP/COEP headers.
+
+tasks:
+  default:
+    desc: "List all tasks"
+    cmds:
+      - task --list-all
+
+  preflight:
+    desc: "Verify toolchain: box3d submodule present + a wasm-capable clang"
+    cmds:
+      # Fresh clones need the vendored Box3D sources.
+      - git submodule update --init
+      # box3d-sys compiles C to wasm32; Apple clang has no wasm backend, so a
+      # wasm-capable clang must exist (build.rs probes the same locations).
+      - |
+        if [ -n "$CC_wasm32_unknown_unknown" ]; then
+          CC="$CC_wasm32_unknown_unknown"
+        elif /opt/homebrew/opt/llvm/bin/clang --print-targets 2>/dev/null | grep -q wasm32; then
+          CC=/opt/homebrew/opt/llvm/bin/clang
+        elif /usr/local/opt/llvm/bin/clang --print-targets 2>/dev/null | grep -q wasm32; then
+          CC=/usr/local/opt/llvm/bin/clang
+        elif clang --print-targets 2>/dev/null | grep -q wasm32; then
+          CC=clang
+        else
+          echo "ERROR: no wasm-capable clang found (Apple clang has no wasm backend)." >&2
+          echo "  Install one:  brew install llvm   (macOS)" >&2
+          echo "                apt install clang   (Linux)" >&2
+          echo "  or set CC_wasm32_unknown_unknown to a wasm-capable clang." >&2
+          exit 1
+        fi
+        echo "preflight OK — box3d submodule ready, wasm clang: $CC"
+
+  dev:
+    desc: "App (trunk, :{{.PORT}}) + live-media server (:{{.PORT_MEDIA}}). Dev builds fetch media from :{{.PORT_MEDIA}} (baked-in MEDIA_BASE), so editor exports show on plain reload."
+    deps: [app-dev, media-dev]
+
+  app-dev:
+    internal: true
+    desc: "trunk serve"
+    deps: [preflight]
+    # Trunk runs from the frontend package (index.html + Trunk.toml live
+    # there); its Trunk.toml points dist back at the repo root.
+    dir: packages/frontend
+    env:
+      # Dev builds fetch media from the side server (`media-dev`) instead of
+      # the dist copy — compiled in via option_env!; production builds
+      # (`task build`) leave it unset and use the page's own base.
+      MEDIA_BASE: "http://127.0.0.1:{{.PORT_MEDIA}}"
+    cmds:
+      - trunk serve --port {{.PORT}}
+
+  media-dev:
+    internal: true
+    # The repo's media/ served directly by a separate http-server: Trunk does
+    # not watch media/, so an editor export writing 10+ files into
+    # media/bundle can't trigger a rebuild/reload storm (whose mid-write
+    # reloads also poisoned the HTTP cache with half-written assets). media/
+    # is laid out exactly like the deployed dist (bundle/ + audio/), so ONE
+    # `?media=` base covers everything. `--cors` covers cross-origin `fetch`.
+    cmds:
+      - http-server media --cors -p {{.PORT_MEDIA}}
+
+  build:
+    desc: "Production build into dist/"
+    deps: [preflight]
+    dir: packages/frontend
+    # PUBLIC_URL defaults to "/" (root host). GitHub Pages serves a project
+    # site under "/<repo>/", so the deploy workflow overrides it:
+    #   task build PUBLIC_URL="/<repo>/"
+    vars:
+      PUBLIC_URL: '{{.PUBLIC_URL | default "/"}}'
+    cmds:
+      - rm -rf ../../dist
+      - trunk build --release --public-url "{{.PUBLIC_URL}}"
+
+  check:
+    desc: "cargo check the wasm build (no serve)"
+    deps: [preflight]
+    cmds:
+      - cargo check --workspace --target wasm32-unknown-unknown
+
+  lint:
+    desc: "clippy on the wasm build, warnings = errors (CI gate)"
+    deps: [preflight]
+    cmds:
+      - cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
+
+  fmt:
+    desc: "format all Rust source"
+    cmds:
+      - cargo fmt --all
+
+  fmt-check:
+    desc: "check formatting without writing (CI gate)"
+    cmds:
+      - cargo fmt --all -- --check
+
+  clean:
+    desc: "Remove build output"
+    cmds:
+      - rm -rf dist target

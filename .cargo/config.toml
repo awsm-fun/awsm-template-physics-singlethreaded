@@ -1,0 +1,17 @@
+# Build flags for the wasm target. Single-threaded, so these are the WHOLE story
+# — there's no env RUSTFLAGS override (the Taskfile no longer sets one), so every
+# build (trunk, `cargo check`, rust-analyzer) uses exactly what's here:
+#   * the two cfgs the deps need (web-sys unstable APIs, getrandom's wasm backend),
+#   * `+simd128` — wasm SIMD, matching box3d-sys's `-msimd128` C build and giving
+#     glam/renderer code the vector path. Every WebGPU-capable browser has it.
+[target.wasm32-unknown-unknown]
+rustflags = [
+    "--cfg=web_sys_unstable_apis",
+    "--cfg=getrandom_backend=\"wasm_js\"",
+    "-C",
+    "target-feature=+simd128",
+]
+
+# Mirror the cfg on native targets so editor tooling doesn't error out.
+[target.'cfg(not(target_arch = "wasm32"))']
+rustflags = ["--cfg=web_sys_unstable_apis"]

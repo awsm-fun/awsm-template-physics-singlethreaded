@@ -1,0 +1,21 @@
+# Trunk builds the frontend from THIS directory (the Taskfile runs trunk with
+# `dir: packages/frontend`); dist stays at the repo root so the deploy
+# workflow and `task clean` keep their paths.
+[build]
+dist = "../../dist"
+
+# Watch ONLY the frontend. media/ is deliberately NOT watched: an editor
+# export writes 10+ files into media/bundle and a watched media/ turned every
+# export into a rebuild/reload storm (whose mid-write reloads also poisoned
+# the browser HTTP cache with half-written assets). In dev, live media comes
+# from the separate `media-dev` http-server instead (Taskfile) — open
+# `http://localhost:9000/?media=http://127.0.0.1:9001`. The copy-dir'd media
+# in dist refreshes on the next (re)build, which is all a deploy needs.
+[watch]
+watch = ["."]
+
+# Single-threaded: NO COOP/COEP headers needed. This build doesn't use a shared
+# `WebAssembly.Memory`, so it runs on any static host with no special headers
+# and no service-worker shim.
+[serve]
+port = 9000
