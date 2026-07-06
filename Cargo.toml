@@ -34,10 +34,10 @@ box3d-sys = { path = "packages/box3d-sys" }
 # deserializer; `awsm-renderer-scene-loader` runs the *player* load path
 # (`load_scene_for_player`) that a shipped game uses; `awsm-renderer-core`
 # exposes the WebGPU builder.
-awsm-renderer = "0.15.0"
-awsm-renderer-core = "0.15.0"
-awsm-renderer-scene = "0.15.0"
-awsm-renderer-scene-loader = { version = "0.15.0", features = ["http"] }
+awsm-renderer = "0.17.0"
+awsm-renderer-core = "0.17.0"
+awsm-renderer-scene = "0.17.0"
+awsm-renderer-scene-loader = { version = "0.17.0", features = ["http"] }
 
 # ── Audio (awsm-audio runtime) ───────────────────────────────────────────────
 # `awsm-audio-player` plays a saved awsm-audio project live; `awsm-audio-schema`
@@ -106,3 +106,12 @@ codegen-units = 1
 # Remove this once a fixed dominator is published to crates.io.
 [patch.crates-io]
 dominator = { git = "https://github.com/Pauan/rust-dominator", rev = "25597cd" }
+
+# TEMP (local development): consume the renderer monorepo checkout directly —
+# branch `updates` carries the concurrent texture prefetch + pool dedupe + the
+# honest load-phase reporting (FetchingTextures / UploadingTextures counts /
+# PreparingMaterials). Remove once those land in a published 0.17.x.
+awsm-renderer = { path = "../../renderer/packages/crates/renderer" }
+awsm-renderer-core = { path = "../../renderer/packages/crates/renderer-core" }
+awsm-renderer-scene = { path = "../../renderer/packages/crates/scene" }
+awsm-renderer-scene-loader = { path = "../../renderer/packages/crates/scene-loader" }
