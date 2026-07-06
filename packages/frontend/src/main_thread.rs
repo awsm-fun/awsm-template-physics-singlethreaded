@@ -297,6 +297,35 @@ fn quality_notice_modal(open: &Mutable<bool>) -> dominator::Dom {
     })
 }
 
+/// The blocking "compiling pipelines" overlay, raised while the worker
+/// recompiles for a Settings anti-aliasing change
+/// ([`RenderMsg::AaCompileStart`] → [`RenderMsg::AaCompileDone`]). Not
+/// user-dismissable — it lowers itself when the worker reports done. `None` =
+/// hidden; `Some(line)` = shown, with the worker's live progress line.
+fn aa_compile_modal(state: &Mutable<Option<String>>) -> dominator::Dom {
+    html!("div", {
+        .class("settings-overlay")
+        // Above the Settings modal that triggered it (both are z-index 20).
+        .style("z-index", "30")
+        .visible_signal(state.signal_cloned().map(|s| s.is_some()))
+        .child(html!("div", {
+            .class("settings-modal")
+            .child(html!("h2", { .text("Compiling Pipelines") }))
+            .child(html!("p", {
+                .class("notice-text")
+                .text("Rebuilding the render pipelines for the new \
+                       anti-aliasing settings. The first switch in each \
+                       direction compiles shaders; after that it's cached and \
+                       instant.")
+            }))
+            .child(html!("p", {
+                .class("settings-hint")
+                .text_signal(state.signal_cloned().map(|s| s.unwrap_or_default()))
+            }))
+        }))
+    })
+}
+
 /// The bottom-center "About" chip.
 fn about_button(open: &Mutable<bool>) -> dominator::Dom {
     html!("button", {
@@ -489,6 +518,9 @@ fn setup(
             || stored_bool(&window, SMAA_STORAGE_KEY).is_none());
     let notice_open = Mutable::new(false);
     dominator::append_dom(&dominator::body(), quality_notice_modal(&notice_open));
+    // The "compiling pipelines" overlay for runtime AA changes (worker-driven).
+    let aa_compile: Mutable<Option<String>> = Mutable::new(None);
+    dominator::append_dom(&dominator::body(), aa_compile_modal(&aa_compile));
 
     // Size the backing store, then transfer the canvas to the worker.
     let (w, h) = res.get().backing();
@@ -540,7 +572,7 @@ fn setup(
 
     // Handle messages coming back from the worker.
     let on_msg = Closure::<dyn FnMut(MessageEvent)>::new(
-        clone!(audio, status, stats, res, user_pref, res_pct, worker_ref, notice_open => move |e: MessageEvent| {
+        clone!(audio, status, stats, res, user_pref, res_pct, worker_ref, notice_open, aa_compile => move |e: MessageEvent| {
             let data = e.data();
             // Audio cue → the WebAudio player.
             if let Ok(msg) = serde_wasm_bindgen::from_value::<AudioMsg>(data.clone()) {
@@ -582,6 +614,17 @@ fn setup(
                         post_resize(wk, &st);
                     }
                 }
+                Ok(RenderMsg::AaCompileStart { msaa, smaa }) => {
+                    aa_compile.set(Some(format!(
+                        "MSAA 4× {} · SMAA {}",
+                        if msaa { "on" } else { "off" },
+                        if smaa { "on" } else { "off" }
+                    )));
+                }
+                Ok(RenderMsg::AaCompileProgress { message }) => {
+                    aa_compile.set(Some(message));
+                }
+                Ok(RenderMsg::AaCompileDone) => aa_compile.set(None),
                 Ok(RenderMsg::Error { message }) => {
                     loading_log(&format!("ERROR: {message}"));
                     status.set(format!("worker error: {message}"));
