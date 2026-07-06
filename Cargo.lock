@@ -1270,6 +1270,7 @@ dependencies = [
  "awsm-renderer-scene-loader",
  "box3d-sys",
  "dominator",
+ "futures",
  "futures-signals",
  "glam 0.32.1",
  "gloo-net",
