@@ -560,6 +560,16 @@ fn setup(
     let payload = js_sys::Object::new();
     set(&payload, "canvas", &offscreen);
     set(&payload, "origin", &JsValue::from_str(&base));
+    // The APP origin (this page) — distinct from `origin`/`base`, which in dev is
+    // the live-media server. The Basis codec worker + transcoder ship with the
+    // app (Trunk copy-file → /workers, /vendor/basis), so the render worker must
+    // spawn them from an ABSOLUTE app-origin URL (a `blob:` worker base can't
+    // resolve a root-relative path). See `game.rs` configure(...).
+    set(
+        &payload,
+        "app_origin",
+        &JsValue::from_str(&window.location().origin().unwrap_or_default()),
+    );
     set(&payload, "msaa", &JsValue::from_bool(msaa.get()));
     set(&payload, "smaa", &JsValue::from_bool(smaa.get()));
     let transfer = js_sys::Array::new();

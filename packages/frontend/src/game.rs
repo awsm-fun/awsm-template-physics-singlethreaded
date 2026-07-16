@@ -135,8 +135,9 @@ impl OrbitCamera {
 /// `OffscreenCanvas` + page origin + desired AA, build the WebGPU device, and
 /// kick off the async load + render loop.
 pub fn start(payload: JsValue) -> Result<(), JsValue> {
+    use awsm_renderer::core::renderer::{AwsmRendererWebGpuBuilder, DeviceRequestLimits};
     use awsm_renderer::web_global::navigator_gpu;
-    use awsm_renderer_core::renderer::{AwsmRendererWebGpuBuilder, DeviceRequestLimits};
+    use awsm_renderer_scene_loader::basis::{configure, BasisWorkerConfig};
 
     let canvas: OffscreenCanvas =
         js_sys::Reflect::get(&payload, &JsValue::from_str("canvas"))?.unchecked_into();
@@ -146,6 +147,23 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
         .ok()
         .and_then(|v| v.as_string())
         .unwrap_or_default();
+    // Provide the Basis codec URLs (the crate hardcodes none). We run the player
+    // load path ON THIS render worker, whose `blob:` base can't resolve a
+    // root-relative URL — so the URLs must be ABSOLUTE, built from the APP origin
+    // (where Trunk copy-file serves /workers/basis-worker.js + /vendor/basis/…).
+    // Note this is the app origin, NOT `origin` above (in dev that's the separate
+    // live-media server, which does not serve the codec).
+    {
+        let app_origin = js_sys::Reflect::get(&payload, &JsValue::from_str("app_origin"))
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_default();
+        let base = app_origin.trim_end_matches('/');
+        configure(BasisWorkerConfig::player(
+            format!("{base}/workers/basis-worker.js"),
+            format!("{base}/vendor/basis/basis_transcoder.js"),
+        ));
+    }
     let get_bool = |key: &str| {
         js_sys::Reflect::get(&payload, &JsValue::from_str(key))
             .ok()
@@ -180,7 +198,7 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
 }
 
 async fn run(
-    gpu_builder: awsm_renderer_core::renderer::AwsmRendererWebGpuBuilder,
+    gpu_builder: awsm_renderer::core::renderer::AwsmRendererWebGpuBuilder,
     canvas: OffscreenCanvas,
     origin: String,
     desired_aa: (bool, bool),
@@ -601,15 +619,23 @@ async fn run(
         // 5. ── Camera + render ──────────────────────────────────────────────
         let cam = camera.borrow();
         let eye = cam.eye();
-        let view = Mat4::look_at_rh(eye, cam.look_at, Vec3::Y);
-        let projection = Mat4::perspective_rh(55.0_f32.to_radians(), aspect(&canvas), 0.1, 400.0);
-        let _ = r.update_camera(CameraMatrices {
-            view,
-            projection,
-            position_world: eye,
-            focus_distance: cam.radius,
-            aperture: 5.6,
-        });
+        // Build the projection under the renderer's own depth convention
+        // (0.21 defaults to reverse-Z): `CameraMatrices::perspective` fills in
+        // `projection`/`reverse_z`/`near`/`far` consistently. Hand-rolling a
+        // forward-Z `perspective_rh` here would invert every depth test.
+        let mut matrices = CameraMatrices::perspective(
+            r.features().depth(),
+            eye,
+            cam.look_at,
+            Vec3::Y,
+            55.0_f32.to_radians(),
+            aspect(&canvas),
+            0.1,
+            400.0,
+        );
+        matrices.focus_distance = cam.radius;
+        matrices.aperture = 5.6;
+        let _ = r.update_camera(matrices);
         drop(cam);
         r.update_transforms();
         if let Err(err) = r.render(None) {
