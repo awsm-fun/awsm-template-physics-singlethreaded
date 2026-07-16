@@ -560,16 +560,15 @@ fn setup(
     let payload = js_sys::Object::new();
     set(&payload, "canvas", &offscreen);
     set(&payload, "origin", &JsValue::from_str(&base));
-    // The APP origin (this page) — distinct from `origin`/`base`, which in dev is
-    // the live-media server. The Basis codec worker + transcoder ship with the
-    // app (Trunk copy-file → /workers, /vendor/basis), so the render worker must
-    // spawn them from an ABSOLUTE app-origin URL (a `blob:` worker base can't
-    // resolve a root-relative path). See `game.rs` configure(...).
-    set(
-        &payload,
-        "app_origin",
-        &JsValue::from_str(&window.location().origin().unwrap_or_default()),
-    );
+    // The APP base — the directory THIS PAGE is served from — distinct from
+    // `origin`/`base` above, which in dev is the live-media server. The Basis
+    // codec worker + transcoder ship with the app (Trunk copy-file → `workers/`,
+    // `vendor/basis/`), so the render worker must spawn them from an ABSOLUTE URL
+    // (its `blob:` base can't resolve a relative path). This must keep the PATH,
+    // not just the origin: under a subpath deploy (GitHub Pages `/<repo>/`, or a
+    // CDN like `/experiments/<slug>/`) the files live under that directory, so a
+    // bare origin would 404. See `game.rs` configure(...).
+    set(&payload, "app_base", &JsValue::from_str(&app_base(&window)));
     set(&payload, "msaa", &JsValue::from_bool(msaa.get()));
     set(&payload, "smaa", &JsValue::from_bool(smaa.get()));
     let transfer = js_sys::Array::new();
@@ -1050,9 +1049,8 @@ fn key_mask(key: &str) -> Option<u32> {
 
 /// The base URL for the media fetches (`bundle/` and `audio/`), with no trailing
 /// slash. Resolution order: `?media=` query param, then the `MEDIA_BASE`
-/// compile-time env (`task dev` sets it to the side media server), then the
-/// directory the page is served from (kept, so it's correct under a GitHub Pages
-/// project base like `/<repo>/`).
+/// compile-time env (`task dev` sets it to the side media server), then — the
+/// production path — the directory the page is served from ([`app_base`]).
 fn page_base(window: &web_sys::Window) -> String {
     let location = window.location();
     if let Ok(search) = location.search() {
@@ -1069,6 +1067,21 @@ fn page_base(window: &web_sys::Window) -> String {
             return base.trim_end_matches('/').to_string();
         }
     }
+    app_base(window)
+}
+
+/// The directory THIS PAGE is served from — origin + the path up to (not
+/// including) the trailing `/` — with no trailing slash. This is where Trunk
+/// lays the app down: `index.html`, the wasm/JS glue, and the copy-file'd
+/// `workers/` + `vendor/basis/`. Keeping the path makes it correct at any
+/// deployment depth: the root (`/`), a GitHub Pages project site (`/<repo>/`),
+/// or a CDN subpath (`/experiments/<slug>/`). Unlike [`page_base`], it never
+/// redirects to the media server, so it always points at the app's own files.
+///   `https://host/experiments/foo/`           → `https://host/experiments/foo`
+///   `https://host/experiments/foo/index.html` → `https://host/experiments/foo`
+///   `http://127.0.0.1:9000/`                   → `http://127.0.0.1:9000`
+fn app_base(window: &web_sys::Window) -> String {
+    let location = window.location();
     let origin = location.origin().unwrap_or_default();
     let mut path = location.pathname().unwrap_or_default();
     if let Some(idx) = path.rfind('/') {
