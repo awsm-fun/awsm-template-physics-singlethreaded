@@ -25,7 +25,9 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::js_sys;
-use web_sys::{HtmlCanvasElement, HtmlInputElement, KeyboardEvent, MessageEvent, Worker};
+use web_sys::{
+    HtmlCanvasElement, HtmlInputElement, HtmlSelectElement, KeyboardEvent, MessageEvent, Worker,
+};
 
 use crate::audio::AudioController;
 use crate::bootstrap::spawn_worker;
@@ -39,6 +41,14 @@ use crate::protocol::{
 type Audio = Rc<RefCell<Option<AudioController>>>;
 
 // ── Resolution scale: the one fill-rate lever ────────────────────────────────
+// The canvas renders at `devicePixelRatio × scale` device pixels; the user owns
+// the slider, we pick only the DEFAULT (while they haven't chosen): native
+// resolution capped at a PIXEL BUDGET ([`DEFAULT_PIXEL_BUDGET`]), further capped
+// by device class (touch / software GPU), never below an effective DPR of 1.
+// Native on any desktop was the old default; measured on a Retina M1 Max at
+// native 2400×1794 this scene's GPU frame missed a 120 Hz display's 8.3 ms
+// budget, and the renderer's cost scales with pixels — hence a pixel budget, not a
+// DPR cap. Never below an effective DPR of 1, so DPR-1 displays keep native.
 /// Floor of the slider (50% of native). The slider's `min` in `index.html` mirrors it.
 const MIN_SCALE: f64 = 0.5;
 /// Ceiling: native resolution. We never supersample here.
@@ -49,6 +59,9 @@ const COARSE_START_SCALE: f64 = 0.6;
 /// Start on a software / fallback adapter — it genuinely can't push pixels, so
 /// seed lower still. Applied when the worker reports the adapter.
 const FALLBACK_START_SCALE: f64 = 0.5;
+/// Backing-store pixels the DEFAULT resolution allows (see the section note).
+/// The user's slider still goes to 100%.
+const DEFAULT_PIXEL_BUDGET: f64 = 2_800_000.0;
 /// Max 2D texture dimension assumed until the worker reports the real one.
 const DEFAULT_MAX_TEX: u32 = 8192;
 /// `localStorage` key for the persisted user choice.
@@ -64,6 +77,9 @@ struct ResState {
     css_w: f64,
     css_h: f64,
     dpr: f64,
+    /// Device-class ceiling for the DEFAULT scale: [`MAX_SCALE`], or lower on
+    /// a touch device / software GPU. Never applied over a user choice.
+    auto_cap: f64,
 }
 
 impl ResState {
@@ -75,6 +91,24 @@ impl ResState {
         let h = ((self.css_h * s).round() as u32).clamp(1, self.max_tex);
         (w, h)
     }
+
+    /// The default scale for the current size: native, capped by the pixel
+    /// budget and the device-class ceiling, floored at an effective DPR of 1
+    /// (and the slider's range).
+    fn auto_scale(&self) -> f64 {
+        let native_px = self.css_w * self.css_h * self.dpr * self.dpr;
+        let budget = if native_px > DEFAULT_PIXEL_BUDGET {
+            (DEFAULT_PIXEL_BUDGET / native_px)
+                .sqrt()
+                .max(1.0 / self.dpr)
+        } else {
+            MAX_SCALE
+        };
+        // Round DOWN to the slider's 5% step so the thumb, its label and the
+        // real scale agree (the browser would snap an 81% value to 80).
+        let stepped = (budget.min(self.auto_cap) * 20.0).floor() / 20.0;
+        stepped.clamp(MIN_SCALE, MAX_SCALE)
+    }
 }
 
 /// Percent form of a scale fraction (0.6 → 60) — the slider's unit.
@@ -82,12 +116,9 @@ fn pct_of(scale: f64) -> u32 {
     (scale * 100.0).round() as u32
 }
 
-/// The scale to start at: a stored user choice if there is one, else a lower
-/// seed on a touch device, else native.
-fn initial_scale(window: &web_sys::Window) -> f64 {
-    if let Some(stored) = stored_scale(window) {
-        return stored;
-    }
+/// The device-class ceiling for the default scale: lower on a touch device.
+/// (A fallback GPU lowers it further once the worker reports in.)
+fn initial_auto_cap(window: &web_sys::Window) -> f64 {
     if coarse_pointer(window) {
         COARSE_START_SCALE
     } else {
@@ -122,16 +153,111 @@ fn store_scale(window: &web_sys::Window, scale: f64) {
     }
 }
 
-// ── Anti-aliasing settings ───────────────────────────────────────────────────
-const MSAA_STORAGE_KEY: &str = "awsm_msaa";
-const SMAA_STORAGE_KEY: &str = "awsm_smaa";
+// ── Anti-aliasing setting ────────────────────────────────────────────────────
+// ONE three-way choice in the Settings modal, persisted: Off / SMAA / MSAA 4×.
+// MSAA+SMAA together isn't offered: on top of a 4× MSAA resolve SMAA buys
+// almost nothing (the renderer itself defaults it off) and costs an extra
+// full-screen pre-pass. SMAA earns its place as the cheap AA when MSAA is off.
+const AA_STORAGE_KEY: &str = "awsm_aa";
+/// The pre-0.42 per-toggle keys — migrated to [`AA_STORAGE_KEY`] once, then
+/// cleared (see [`clear_legacy_aa`]).
+const LEGACY_AA_STORAGE_KEYS: [&str; 2] = ["awsm_msaa", "awsm_smaa"];
 /// `localStorage` key for the stats-panel toggle (default OFF — the panel eats a
 /// lot of a phone screen, so it's opt-in via the bottom-left Stats chip).
 const STATS_STORAGE_KEY: &str = "awsm_stats";
-/// Default anti-aliasing on a fine-pointer (desktop) device. On `pointer: coarse`
-/// devices BOTH toggles default OFF (the mobile defaults optimize for frame rate).
-const MSAA_DEFAULT: bool = true;
-const SMAA_DEFAULT: bool = true;
+/// The anti-aliasing modes the Settings modal offers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AaMode {
+    Off,
+    Smaa,
+    Msaa,
+}
+
+impl AaMode {
+    const ALL: [AaMode; 3] = [AaMode::Off, AaMode::Smaa, AaMode::Msaa];
+
+    /// The renderer's `(msaa, smaa)` pair for this mode.
+    fn flags(self) -> (bool, bool) {
+        match self {
+            AaMode::Off => (false, false),
+            AaMode::Smaa => (false, true),
+            AaMode::Msaa => (true, false),
+        }
+    }
+
+    /// Storage / `<option>` value.
+    fn key(self) -> &'static str {
+        match self {
+            AaMode::Off => "off",
+            AaMode::Smaa => "smaa",
+            AaMode::Msaa => "msaa",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            AaMode::Off => "Off",
+            AaMode::Smaa => "SMAA",
+            AaMode::Msaa => "MSAA 4×",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|m| m.key() == s)
+    }
+}
+
+/// Default anti-aliasing on a fine-pointer (desktop) device. On
+/// `pointer: coarse` devices it defaults to [`AaMode::Off`] instead: like the
+/// [`COARSE_START_SCALE`] resolution seed, the mobile defaults optimize
+/// purely for frame rate — and because that visibly costs quality, a notice
+/// modal points the user at Settings (see `quality_notice_modal`). A stored
+/// user choice always wins over either default.
+const AA_DEFAULT: AaMode = AaMode::Msaa;
+
+/// The persisted anti-aliasing choice, if the user has made one.
+fn stored_aa(window: &web_sys::Window) -> Option<AaMode> {
+    let ls = window.local_storage().ok().flatten()?;
+    AaMode::parse(&ls.get_item(AA_STORAGE_KEY).ok().flatten()?)
+}
+
+/// Persist the user's anti-aliasing choice.
+fn store_aa(window: &web_sys::Window, mode: AaMode) {
+    if let Ok(Some(ls)) = window.local_storage() {
+        let _ = ls.set_item(AA_STORAGE_KEY, mode.key());
+    }
+}
+
+/// Carry an explicit pre-0.42 choice over to [`AA_STORAGE_KEY`], then drop the
+/// legacy per-toggle keys (see [`LEGACY_AA_STORAGE_KEYS`]). The old keys were
+/// only ever written by a user toggle, so they are real choices: MSAA off maps
+/// to SMAA if SMAA was on, else Off; MSAA on maps to MSAA (SMAA alongside it
+/// isn't offered any more). Unset legacy keys leave the new default in place.
+fn clear_legacy_aa(window: &web_sys::Window) {
+    let Ok(Some(ls)) = window.local_storage() else {
+        return;
+    };
+    let get = |k: &str| ls.get_item(k).ok().flatten();
+    let (msaa, smaa) = (
+        get(LEGACY_AA_STORAGE_KEYS[0]),
+        get(LEGACY_AA_STORAGE_KEYS[1]),
+    );
+    if get(AA_STORAGE_KEY).is_none() {
+        let migrated = match (msaa.as_deref(), smaa.as_deref()) {
+            (Some("1"), _) => Some(AaMode::Msaa),
+            (Some("0"), Some("1")) => Some(AaMode::Smaa),
+            (Some("0"), _) => Some(AaMode::Off),
+            (None, Some("1")) => Some(AaMode::Msaa),
+            _ => None,
+        };
+        if let Some(mode) = migrated {
+            let _ = ls.set_item(AA_STORAGE_KEY, mode.key());
+        }
+    }
+    for key in LEGACY_AA_STORAGE_KEYS {
+        let _ = ls.remove_item(key);
+    }
+}
 
 /// Read a persisted boolean setting (`"1"`/`"0"`), `None` if unset.
 fn stored_bool(window: &web_sys::Window, key: &str) -> Option<bool> {
@@ -166,8 +292,9 @@ fn maybe_reset_settings(window: &web_sys::Window) {
     if let Ok(Some(ls)) = window.local_storage() {
         for key in [
             RES_STORAGE_KEY,
-            MSAA_STORAGE_KEY,
-            SMAA_STORAGE_KEY,
+            AA_STORAGE_KEY,
+            LEGACY_AA_STORAGE_KEYS[0],
+            LEGACY_AA_STORAGE_KEYS[1],
             STATS_STORAGE_KEY,
         ] {
             let _ = ls.remove_item(key);
@@ -472,10 +599,15 @@ pub fn fatal(message: &str) {
 
 /// Format a [`StatsMsg`] into the panel's text block.
 fn format_stats(s: &StatsMsg) -> String {
+    let gpu = match s.gpu_ms {
+        Some(ms) => format!("{ms:.1} ms"),
+        None if s.gpu_unavailable => "n/a".to_string(),
+        None => "—".to_string(),
+    };
     format!(
-        "engine\n  fps           {:.0}\n  frame time    {:.1} ms\n  physics time  {:.2} ms\n  \
-         physics       {:.0} steps/s\n\nballs dropped  {}",
-        s.fps, s.frame_ms, s.step_ms, s.sps, s.balls
+        "engine\n  fps           {:.0}\n  gpu time      {}\n  cpu time      {:.1} ms\n  \
+         physics time  {:.2} ms\n  physics       {:.0} steps/s\n\nballs dropped  {}",
+        s.fps, gpu, s.frame_ms, s.step_ms, s.sps, s.balls
     )
 }
 
@@ -489,33 +621,28 @@ fn setup(
     let window = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?;
 
     // ── Resolution scale (the fill-rate lever) ──────────────────────────────
-    let res = Rc::new(Cell::new(ResState {
-        scale: initial_scale(&window),
+    let mut res0 = ResState {
+        scale: MAX_SCALE,
         max_tex: DEFAULT_MAX_TEX,
         css_w: canvas.client_width().max(1) as f64,
         css_h: canvas.client_height().max(1) as f64,
         dpr: window.device_pixel_ratio().max(1.0),
-    }));
+        auto_cap: initial_auto_cap(&window),
+    };
+    // A stored user choice wins; otherwise the budgeted default.
+    res0.scale = stored_scale(&window).unwrap_or_else(|| res0.auto_scale());
+    let res = Rc::new(Cell::new(res0));
     let user_pref = Rc::new(Cell::new(stored_scale(&window).is_some()));
     let res_pct = Mutable::new(pct_of(res.get().scale));
 
-    // Anti-aliasing toggles (persisted). Coarse-pointer devices default BOTH off.
+    // Anti-aliasing mode (persisted). Coarse-pointer devices default to Off.
     let coarse = coarse_pointer(&window);
-    let msaa = Mutable::new(stored_bool(&window, MSAA_STORAGE_KEY).unwrap_or(if coarse {
-        false
-    } else {
-        MSAA_DEFAULT
-    }));
-    let smaa = Mutable::new(stored_bool(&window, SMAA_STORAGE_KEY).unwrap_or(if coarse {
-        false
-    } else {
-        SMAA_DEFAULT
-    }));
+    clear_legacy_aa(&window);
+    let aa =
+        Mutable::new(stored_aa(&window).unwrap_or(if coarse { AaMode::Off } else { AA_DEFAULT }));
     // Reduced-quality notice (touch devices): shown when the coarse seeds applied.
-    let show_quality_notice = coarse
-        && (stored_scale(&window).is_none()
-            || stored_bool(&window, MSAA_STORAGE_KEY).is_none()
-            || stored_bool(&window, SMAA_STORAGE_KEY).is_none());
+    let show_quality_notice =
+        coarse && (stored_scale(&window).is_none() || stored_aa(&window).is_none());
     let notice_open = Mutable::new(false);
     dominator::append_dom(&dominator::body(), quality_notice_modal(&notice_open));
     // The "compiling pipelines" overlay for runtime AA changes (worker-driven).
@@ -569,8 +696,9 @@ fn setup(
     // CDN like `/experiments/<slug>/`) the files live under that directory, so a
     // bare origin would 404. See `game.rs` configure(...).
     set(&payload, "app_base", &JsValue::from_str(&app_base(&window)));
-    set(&payload, "msaa", &JsValue::from_bool(msaa.get()));
-    set(&payload, "smaa", &JsValue::from_bool(smaa.get()));
+    let (msaa0, smaa0) = aa.get().flags();
+    set(&payload, "msaa", &JsValue::from_bool(msaa0));
+    set(&payload, "smaa", &JsValue::from_bool(smaa0));
     let transfer = js_sys::Array::new();
     transfer.push(&offscreen);
 
@@ -610,13 +738,16 @@ fn setup(
                     st.max_tex = max_texture_dim.max(1);
                     // A software adapter can't push pixels — seed lower, but
                     // never override a choice the user has already made.
-                    if is_fallback && !user_pref.get() && st.scale > FALLBACK_START_SCALE {
-                        st.scale = FALLBACK_START_SCALE;
-                        res_pct.set(pct_of(FALLBACK_START_SCALE));
-                        loading_log(&format!(
-                            "software GPU detected — starting at {}% resolution",
-                            pct_of(FALLBACK_START_SCALE)
-                        ));
+                    if is_fallback {
+                        st.auto_cap = st.auto_cap.min(FALLBACK_START_SCALE);
+                        if !user_pref.get() && st.scale > st.auto_scale() {
+                            st.scale = st.auto_scale();
+                            res_pct.set(pct_of(st.scale));
+                            loading_log(&format!(
+                                "software GPU detected — starting at {}% resolution",
+                                pct_of(st.scale)
+                            ));
+                        }
                     }
                     res.set(st);
                     if let Some(wk) = worker_ref.borrow().as_ref() {
@@ -651,16 +782,22 @@ fn setup(
     // Keyboard → InputMsg; a keypress also starts audio.
     install_keyboard(&window, worker.clone(), audio.clone())?;
     // Canvas layout size → ResizeMsg (backing store in device pixels).
-    install_resize(&window, &canvas, worker.clone(), res.clone())?;
-    // Settings modal: resolution slider (→ ResizeMsg) + MSAA/SMAA (→ QualityMsg).
+    install_resize(
+        &window,
+        &canvas,
+        worker.clone(),
+        res.clone(),
+        user_pref.clone(),
+        res_pct.clone(),
+    )?;
+    // Settings modal: resolution slider (→ ResizeMsg) + AA mode (→ QualityMsg).
     install_settings(
         window.clone(),
         worker.clone(),
         res.clone(),
         user_pref,
         res_pct,
-        msaa,
-        smaa,
+        aa,
     )?;
     // Pointer: click drops a ball, right-drag orbits, wheel zooms, touch flings.
     install_pointer(&window, &canvas, worker, audio, yaw)?;
@@ -680,6 +817,8 @@ fn install_resize(
     canvas: &HtmlCanvasElement,
     worker: Worker,
     res: Rc<Cell<ResState>>,
+    user_pref: Rc<Cell<bool>>,
+    res_pct: Mutable<u32>,
 ) -> Result<(), JsValue> {
     let win = window.clone();
     let cb = Closure::<dyn FnMut(js_sys::Array)>::new(move |entries: js_sys::Array| {
@@ -691,6 +830,12 @@ fn install_resize(
         st.dpr = win.device_pixel_ratio().max(1.0);
         st.css_w = rect.width().max(1.0);
         st.css_h = rect.height().max(1.0);
+        // The default resolution is size-dependent (pixel budget): re-derive
+        // it — but never over a user's slider choice.
+        if !user_pref.get() {
+            st.scale = st.auto_scale();
+            res_pct.set_neq(pct_of(st.scale));
+        }
         res.set(st);
         post_resize(&worker, &st);
     });
@@ -711,8 +856,7 @@ fn install_settings(
     res: Rc<Cell<ResState>>,
     user_pref: Rc<Cell<bool>>,
     res_pct: Mutable<u32>,
-    msaa: Mutable<bool>,
-    smaa: Mutable<bool>,
+    aa: Mutable<AaMode>,
 ) -> Result<(), JsValue> {
     let open = Mutable::new(false);
 
@@ -752,31 +896,31 @@ fn install_settings(
         }))
     });
 
-    // A labelled checkbox row driving one AA toggle. Both flags are re-read on
-    // change so the posted `QualityMsg` always carries the current pair.
-    let aa_row = |label: &str, flag: Mutable<bool>, key: &'static str, is_msaa: bool| {
-        html!("div", {
-            .class("settings-row")
-            .child(html!("label", { .class("settings-label").text(label) }))
-            .child(html!("input" => HtmlInputElement, {
-                .class("settings-toggle")
-                .attr("type", "checkbox")
-                .attr("aria-label", label)
-                .prop_signal("checked", flag.signal())
-                .with_node!(el => {
-                    .event(clone!(flag, msaa, smaa, window, worker => move |_: dominator::events::Change| {
-                        let on = el.checked();
-                        flag.set_neq(on);
-                        store_bool(&window, key, on);
-                        let (m, s) = if is_msaa { (on, smaa.get()) } else { (msaa.get(), on) };
-                        post(&worker, &QualityMsg::AntiAlias { msaa: m, smaa: s });
-                    }))
-                })
-            }))
-        })
-    };
-    let msaa_row = aa_row("MSAA 4×", msaa.clone(), MSAA_STORAGE_KEY, true);
-    let smaa_row = aa_row("SMAA", smaa.clone(), SMAA_STORAGE_KEY, false);
+    // Anti-aliasing: one three-way choice (see [`AaMode`]). A change persists
+    // and posts the renderer's `(msaa, smaa)` pair to the worker.
+    let aa_row = html!("div", {
+        .class("settings-row")
+        .child(html!("label", { .class("settings-label").text("Anti-aliasing") }))
+        .child(html!("select" => HtmlSelectElement, {
+            .class("settings-select")
+            .attr("aria-label", "anti-aliasing")
+            .children(AaMode::ALL.into_iter().map(|m| html!("option", {
+                .attr("value", m.key())
+                .text(m.label())
+            })))
+            .prop_signal("value", aa.signal().map(|m| m.key().to_string()))
+            .with_node!(el => {
+                .event(clone!(aa, window, worker => move |_: dominator::events::Change| {
+                    let Some(mode) = AaMode::parse(&el.value()) else { return };
+                    if aa.replace(mode) != mode {
+                        store_aa(&window, mode);
+                        let (msaa, smaa) = mode.flags();
+                        post(&worker, &QualityMsg::AntiAlias { msaa, smaa });
+                    }
+                }))
+            })
+        }))
+    });
 
     let modal = html!("div", {
         .class("settings-overlay")
@@ -805,8 +949,7 @@ fn install_settings(
             }))
             .child(html!("h2", { .text("Settings") }))
             .child(resolution_row)
-            .child(msaa_row)
-            .child(smaa_row)
+            .child(aa_row)
             .child(html!("p", {
                 .class("settings-hint")
                 .text("Adjust these settings if your framerate is low.")
