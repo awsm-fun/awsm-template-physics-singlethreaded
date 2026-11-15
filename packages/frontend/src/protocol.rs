@@ -324,6 +324,13 @@ pub enum RenderMsg {
 pub struct StatsMsg {
     /// Presented frames per second (vsync-capped).
     pub fps: f32,
+    /// Avg whole-frame GPU ms (renderer timestamp queries) — what decides
+    /// whether a frame makes vsync. `None` until a sample lands; stays `None`
+    /// on a device without `timestamp-query`.
+    pub gpu_ms: Option<f32>,
+    /// True once enough windows have passed with no GPU sample that the
+    /// device evidently can't time the GPU (the panel then says `n/a`).
+    pub gpu_unavailable: bool,
     /// Avg render CPU ms per frame (workload metric, monitor-independent).
     pub frame_ms: f32,
     /// Avg physics CPU ms per fixed step.
