@@ -32,8 +32,8 @@ use web_sys::{
 use crate::audio::AudioController;
 use crate::bootstrap::spawn_worker;
 use crate::protocol::{
-    AudioMsg, CameraMsg, DropMsg, InputMsg, QualityMsg, RenderMsg, ResizeMsg, StatsMsg,
-    CAMERA_ORBIT_SENSITIVITY, HELD_BACK, HELD_FORWARD, HELD_LEFT, HELD_RIGHT,
+    AudioMsg, CameraMsg, CameraPose, DropMsg, InputMsg, QualityMsg, RenderMsg, ResizeMsg, StatsMsg,
+    HELD_BACK, HELD_FORWARD, HELD_LEFT, HELD_RIGHT,
 };
 
 /// Shared, lazily-loaded audio. `None` until the export finishes loading; stays
@@ -663,18 +663,17 @@ fn setup(
     // can't resolve them).
     let base = page_base(&window);
 
-    // The camera yaw main mirrors for the audio listener. The worker owns the
-    // real camera; main integrates the SAME orbit deltas with the SAME
-    // sensitivity, so the audio heading and the visual stay in lockstep without
-    // exchanging the angle (see `CAMERA_ORBIT_SENSITIVITY`).
-    let yaw = Rc::new(Cell::new(0.0_f32));
+    // The camera pose. Main owns it: pointer drags and the wheel change it
+    // here, the audio listener follows its yaw at once, and `install_camera`
+    // posts it to the worker once per main frame (see `CameraMsg`).
+    let camera = Rc::new(Cell::new(CameraPose::START));
 
     // Kick off the (async) audio load now; it stays silent until the first gesture.
     let audio: Audio = Rc::new(RefCell::new(None));
-    spawn_local(clone!(audio, status, base, yaw => async move {
+    spawn_local(clone!(audio, status, base, camera => async move {
         match AudioController::load(&base).await {
             Ok(mut controller) => {
-                controller.set_camera_yaw(yaw.get());
+                controller.set_camera_yaw(camera.get().yaw);
                 *audio.borrow_mut() = Some(controller);
                 tracing::info!("audio loaded");
                 loading_log("audio project loaded (roll + hit/land voices)");
@@ -817,8 +816,10 @@ fn setup(
         res_pct,
         aa,
     )?;
+    // Camera pose → the worker, once per main frame while it changes.
+    install_camera(&window, worker.clone(), camera.clone())?;
     // Pointer: click drops a ball, right-drag orbits, wheel zooms, touch flings.
-    install_pointer(&window, &canvas, worker, audio, yaw)?;
+    install_pointer(&window, &canvas, worker, audio, camera)?;
 
     status.set("loading scene…".into());
     Ok(())
@@ -998,18 +999,62 @@ struct Swipe {
     samples: Vec<(f64, f32, f32)>,
 }
 
+/// Post the camera pose to the worker from main's own `requestAnimationFrame`,
+/// stamped with that frame's time on the absolute clock
+/// (`performance.timeOrigin + timestamp`), and only when it changed: the
+/// worker keeps the last few and draws the right one each frame (see
+/// [`CameraMsg`] for why it is per frame and not per event).
+fn install_camera(
+    window: &web_sys::Window,
+    worker: Worker,
+    camera: Rc<Cell<CameraPose>>,
+) -> Result<(), JsValue> {
+    type FrameLoop = Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>>;
+    let time_origin = window
+        .performance()
+        .ok_or_else(|| JsValue::from_str("no performance"))?
+        .time_origin();
+    let cb: FrameLoop = Rc::new(RefCell::new(None));
+    let next = cb.clone();
+    let win = window.clone();
+    // Nothing posted yet: the worker starts at the same `START` pose.
+    let mut sent = CameraPose::START;
+    *cb.borrow_mut() = Some(Closure::new(move |t: f64| {
+        let pose = camera.get();
+        if pose != sent {
+            sent = pose;
+            post(
+                &worker,
+                &CameraMsg::Pose {
+                    t: time_origin + t,
+                    pose,
+                },
+            );
+        }
+        if let Some(f) = next.borrow().as_ref() {
+            let _ = win.request_animation_frame(f.as_ref().unchecked_ref());
+        }
+    }));
+    if let Some(f) = cb.borrow().as_ref() {
+        window.request_animation_frame(f.as_ref().unchecked_ref())?;
+    }
+    // The loop runs for the session; the closure keeps itself alive.
+    std::mem::forget(cb);
+    Ok(())
+}
+
 /// Wire pointer input. A **left click drops a ball**: the click point is posted
 /// as an NDC [`DropMsg`] (the worker unprojects it onto the table). A
-/// **right-button drag orbits** the camera ([`CameraMsg::Orbit`]) and updates
-/// the audio listener; the **wheel zooms** ([`CameraMsg::Zoom`]). A **touch
-/// swipe flings the ball** ([`InputMsg::Fling`]); a short still touch stays a
-/// tap → drop.
+/// **right-button drag orbits** the camera and turns the audio listener with
+/// it; the **wheel zooms**. Both change main's [`CameraPose`], which
+/// [`install_camera`] posts once per frame. A **touch swipe flings the ball**
+/// ([`InputMsg::Fling`]); a short still touch stays a tap → drop.
 fn install_pointer(
     window: &web_sys::Window,
     canvas: &HtmlCanvasElement,
     worker: Worker,
     audio: Audio,
-    yaw: Rc<Cell<f32>>,
+    camera: Rc<Cell<CameraPose>>,
 ) -> Result<(), JsValue> {
     // Set when a touch swipe just flung the ball: the browser still synthesizes a
     // `click` afterward, and a fling must not ALSO drop a ball.
@@ -1075,10 +1120,10 @@ fn install_pointer(
     menu.forget();
 
     // pointermove on the window so a drag keeps orbiting even off-canvas. The
-    // orbit delta goes to the worker (the visual); its dx also advances OUR yaw
-    // with the same sensitivity → the audio listener, keeping the two in lockstep.
+    // drag turns main's camera pose (posted to the worker once per frame) and
+    // the audio listener with it.
     let move_ = Closure::<dyn FnMut(web_sys::PointerEvent)>::new(
-        clone!(dragging, worker, audio, yaw, swipe => move |e: web_sys::PointerEvent| {
+        clone!(dragging, audio, camera, swipe => move |e: web_sys::PointerEvent| {
             if let Some(s) = swipe.borrow_mut().as_mut() {
                 if e.pointer_id() == s.id {
                     let t = e.time_stamp();
@@ -1091,14 +1136,12 @@ fn install_pointer(
                 return;
             }
             if dragging.get() {
-                let dx = e.movement_x() as f32;
-                let dy = e.movement_y() as f32;
-                let y = yaw.get() - dx * CAMERA_ORBIT_SENSITIVITY;
-                yaw.set(y);
+                let mut pose = camera.get();
+                pose.orbit(e.movement_x() as f32, e.movement_y() as f32);
+                camera.set(pose);
                 if let Some(c) = audio.borrow_mut().as_mut() {
-                    c.set_camera_yaw(y);
+                    c.set_camera_yaw(pose.yaw);
                 }
-                post(&worker, &CameraMsg::Orbit { dx, dy });
             }
         }),
     );
@@ -1157,9 +1200,11 @@ fn install_pointer(
 
     // wheel on the canvas zooms (preventDefault so the page doesn't scroll).
     let wheel = Closure::<dyn FnMut(web_sys::WheelEvent)>::new(
-        clone!(worker => move |e: web_sys::WheelEvent| {
+        clone!(camera => move |e: web_sys::WheelEvent| {
             e.prevent_default();
-            post(&worker, &CameraMsg::Zoom { dy: e.delta_y() as f32 });
+            let mut pose = camera.get();
+            pose.zoom(e.delta_y() as f32);
+            camera.set(pose);
         }),
     );
     canvas.add_event_listener_with_callback("wheel", wheel.as_ref().unchecked_ref())?;

@@ -25,8 +25,9 @@
 //! ```
 //!
 //! Every crossing is a `postMessage` on a cold path (input events, layout
-//! changes, audio cues, ~1 Hz stats) — never per-frame render data. The two
-//! threads share nothing else.
+//! changes, audio cues, ~1 Hz stats) — never per-frame render data — except
+//! the camera, which main posts at most once per main frame while it moves
+//! (see [`CameraMsg`]). The two threads share nothing else.
 
 use std::cell::Cell;
 
@@ -91,10 +92,17 @@ pub const HELD_RIGHT: u32 = 1 << 3;
 /// The discrete actions (jump, fling) are edge-detected by a monotonic counter
 /// the reader diffs against its last-seen value, so one press = exactly one
 /// action even though physics *polls* rather than receiving an event.
+///
+/// Held keys are a level, but a tap that goes down and up between two steps
+/// must still move the ball: every key that goes down is also latched in
+/// `pressed` until the next step reads it ([`Input::held_for_step`]), so each
+/// press counts for at least one step.
 #[derive(Default)]
 pub struct Input {
     /// Bitset of currently-held movement keys (`HELD_*`).
     held: Cell<u32>,
+    /// Keys that went down since the last step read the input (`HELD_*`).
+    pressed: Cell<u32>,
     /// Bumped once per discrete jump press (edge-detected by physics).
     jump_seq: Cell<u32>,
     /// Bumped once per touch-swipe fling gesture (edge-detected by physics).
@@ -110,15 +118,23 @@ impl Input {
         Self::default()
     }
 
-    /// Main side: set/clear one held-key bit.
+    /// Main side: set/clear one held-key bit. A key going down is also
+    /// latched until the next step, so a quick tap is never lost.
     pub fn set_held(&self, mask: u32, down: bool) {
         let cur = self.held.get();
-        self.held.set(if down { cur | mask } else { cur & !mask });
+        if down {
+            self.held.set(cur | mask);
+            self.pressed.set(self.pressed.get() | mask);
+        } else {
+            self.held.set(cur & !mask);
+        }
     }
 
-    /// Physics side: the current held-key bitset.
-    pub fn held(&self) -> u32 {
-        self.held.get()
+    /// Physics side, once per step: the keys to act on this step — those held
+    /// now plus any pressed (and maybe already released) since the previous
+    /// step. Clears the latch.
+    pub fn held_for_step(&self) -> u32 {
+        self.held.get() | self.pressed.replace(0)
     }
 
     /// Main side: register a discrete jump press.
@@ -223,14 +239,51 @@ pub enum AudioMsg {
     },
 }
 
-/// Radians of camera yaw per CSS pixel of horizontal drag. Lives here because
-/// TWO integrators must agree on it without exchanging the angle: the worker's
-/// `OrbitCamera` (the visual + physics W/A/S/D basis) and the main thread's
-/// mirrored yaw (fed to the audio listener so the stereo image orbits with the
-/// view). Both apply `yaw -= dx * CAMERA_ORBIT_SENSITIVITY` to the same drag
-/// deltas from the same start, so they stay in lockstep — main updates audio
-/// immediately while the worker updates the visual at its next frame.
+/// Radians of camera yaw (and pitch) per CSS pixel of drag.
 pub const CAMERA_ORBIT_SENSITIVITY: f32 = 0.005;
+
+/// Where the orbit camera sits around its fixed look-at point: spherical
+/// `(yaw, pitch, radius)`. The MAIN thread owns it: pointer drags and the
+/// wheel change it there ([`CameraPose::orbit`], [`CameraPose::zoom`], with
+/// the clamps), and main posts the result to the worker once per main frame
+/// as a [`CameraMsg::Pose`]. The worker only draws it (and rotates W/A/S/D by
+/// its yaw), so the two can never disagree about the angle.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CameraPose {
+    /// Radians around +Y; 0 = looking from +Z.
+    pub yaw: f32,
+    /// Radians above the horizon.
+    pub pitch: f32,
+    /// Distance from the look-at point.
+    pub radius: f32,
+}
+
+impl CameraPose {
+    /// Initial framing: head-on from +Z, tilted ~26° down.
+    pub const START: Self = Self {
+        yaw: 0.0,
+        pitch: 0.46,
+        radius: 9.0,
+    };
+    /// Just under 90° so the camera never flips over the pole.
+    const PITCH_MAX: f32 = std::f32::consts::FRAC_PI_2 - 0.01;
+    /// Floor keeps the eye above the table rim — never under the felt.
+    const PITCH_MIN: f32 = 0.15;
+    const MIN_RADIUS: f32 = 2.0;
+    const MAX_RADIUS: f32 = 25.0;
+
+    /// Apply a drag delta (CSS pixels): horizontal → yaw, vertical → pitch.
+    pub fn orbit(&mut self, dx: f32, dy: f32) {
+        self.yaw -= dx * CAMERA_ORBIT_SENSITIVITY;
+        self.pitch =
+            (self.pitch - dy * CAMERA_ORBIT_SENSITIVITY).clamp(Self::PITCH_MIN, Self::PITCH_MAX);
+    }
+
+    /// Apply a wheel delta — positive `dy` (scroll down) dollies out.
+    pub fn zoom(&mut self, dy: f32) {
+        self.radius = (self.radius * (1.0 + dy * 0.001)).clamp(Self::MIN_RADIUS, Self::MAX_RADIUS);
+    }
+}
 
 // ── The postMessage protocol ─────────────────────────────────────────────────
 // Each enum is `serde`-tagged with a distinct discriminator so a receiver can
@@ -249,15 +302,27 @@ pub enum InputMsg {
     Fling { vx: f32, vz: f32 },
 }
 
-/// Main → worker: a camera gesture. The worker owns the `OrbitCamera`; main just
-/// forwards the pointer deltas (and separately mirrors the yaw for audio).
+/// Main → worker: the camera as of one main-thread frame.
+///
+/// Pointer events arrive on the main thread once per main frame, but the
+/// worker's frames are not in step with when its messages arrive: forwarding
+/// each event as it came would hand some worker frames no movement and the
+/// next two, and the orbit would judder. So main collects a frame's input into
+/// its [`CameraPose`] and posts the pose from its own `requestAnimationFrame`,
+/// stamped with that frame's time. The worker draws, each frame, the newest
+/// pose stamped at least half a frame before its own frame time: main's
+/// previous frame, which has certainly arrived. Exactly one frame of input per
+/// drawn frame, one frame behind (see `game::CameraQueue`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cam", rename_all = "kebab-case")]
 pub enum CameraMsg {
-    /// A right-drag delta (CSS pixels): yaw from `dx`, pitch from `dy`.
-    Orbit { dx: f32, dy: f32 },
-    /// A wheel delta — dollies the camera in/out.
-    Zoom { dy: f32 },
+    Pose {
+        /// Main's rAF time for the frame, on the absolute clock
+        /// (`performance.timeOrigin + timestamp`, ms), so the worker can
+        /// compare it with its own frame times despite its own time origin.
+        t: f64,
+        pose: CameraPose,
+    },
 }
 
 /// Main → worker: the user clicked the canvas at the given NDC point (x right,

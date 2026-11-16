@@ -6,6 +6,8 @@
 //! threads share nothing; input arrives as [`InputMsg`]/[`CameraMsg`]/… and
 //! audio cues + stats go back as [`AudioMsg`]/[`StatsMsg`]. Each frame:
 //!
+//! 0. take the camera pose main posted for its previous frame (exactly one
+//!    main frame of orbit/zoom per drawn frame — see [`CameraQueue`]),
 //! 1. drain click-drops (unproject onto the tabletop, spawn a ball),
 //! 2. step the fixed-timestep [`World`] as many times as elapsed real time
 //!    bought (the accumulator),
@@ -42,14 +44,16 @@ use web_sys::OffscreenCanvas;
 
 use crate::physics::{Pose, World};
 use crate::protocol::{
-    AudioMsg, CameraMsg, ColliderInit, ColliderShapeMsg, DropMsg, Input, InputMsg, QualityMsg,
-    RenderMsg, ResizeMsg, StatsMsg, ROLE_FLOOR, SIM_HZ,
+    AudioMsg, CameraMsg, CameraPose, ColliderInit, ColliderShapeMsg, DropMsg, Input, InputMsg,
+    QualityMsg, RenderMsg, ResizeMsg, StatsMsg, ROLE_FLOOR, SIM_HZ,
 };
 
 /// Player input, held on the worker and fed by [`InputMsg`]s.
 type SharedInput = Rc<Input>;
 /// The one orbit camera (render + physics W/A/S/D basis), driven by [`CameraMsg`].
 type SharedCamera = Rc<RefCell<OrbitCamera>>;
+/// The camera poses main has posted, newest last (see [`CameraQueue`]).
+type SharedCameraQueue = Rc<RefCell<CameraQueue>>;
 /// Pending click-drops as NDC points, drained + unprojected by the loop.
 type DropQueue = Rc<RefCell<Vec<(f32, f32)>>>;
 /// A pending Settings anti-aliasing change `(msaa, smaa)`, applied off the render path.
@@ -73,6 +77,9 @@ const MAX_SUBSTEPS: u32 = (MAX_FRAME_MS / 1000.0 * SIM_HZ + 0.999) as u32;
 // ── Stats ────────────────────────────────────────────────────────────────────
 /// EMA weight for the reported fps / steps-per-second (per ~1 s window).
 const STATS_EMA_ALPHA: f64 = 0.35;
+/// Smoothing weight of each frame gap in the display-period estimate used to
+/// pick the camera pose (see [`CameraQueue`]); only needs to be roughly right.
+const PERIOD_EMA_ALPHA: f64 = 0.1;
 /// Frames that must present before stats counting starts — boot samples read
 /// 2–3× the settled cost (cold caches, pipeline warmup).
 const STATS_WARMUP_FRAMES: u32 = 60;
@@ -84,11 +91,10 @@ const CAMERA_FOV_Y_DEG: f32 = 55.0;
 const CAMERA_NEAR: f32 = 0.1;
 const CAMERA_FAR: f32 = 400.0;
 
-/// A minimal mouse-driven orbit camera (after the renderer's `model-tests`
-/// `OrbitCamera`): it circles a fixed `look_at` point at spherical
-/// `(yaw, pitch, radius)`. Right-drag to orbit, wheel to dolly (no pan — the
-/// table can never leave the frame). Physics rotates W/A/S/D by its `yaw`; main
-/// mirrors the same yaw for the audio listener (see [`CameraMsg`]).
+/// A minimal orbit camera (after the renderer's `model-tests` `OrbitCamera`):
+/// it circles a fixed `look_at` point at spherical `(yaw, pitch, radius)` (no
+/// pan — the table can never leave the frame). The pose comes from main (see
+/// [`CameraPose`] and [`CameraQueue`]); physics rotates W/A/S/D by its `yaw`.
 pub struct OrbitCamera {
     pub look_at: Vec3,
     pub radius: f32,
@@ -97,32 +103,20 @@ pub struct OrbitCamera {
 }
 
 impl OrbitCamera {
-    const SENSITIVITY: f32 = crate::protocol::CAMERA_ORBIT_SENSITIVITY;
-    /// Just under 90° so the camera never flips over the pole.
-    const PITCH_MAX: f32 = std::f32::consts::FRAC_PI_2 - 0.01;
-    /// Floor keeps the eye above the table rim — never under the felt.
-    const PITCH_MIN: f32 = 0.15;
-    const MIN_RADIUS: f32 = 2.0;
-    const MAX_RADIUS: f32 = 25.0;
-
-    pub fn new(look_at: Vec3, radius: f32, yaw: f32, pitch: f32) -> Self {
+    pub fn new(look_at: Vec3, pose: CameraPose) -> Self {
         Self {
             look_at,
-            radius,
-            yaw,
-            pitch,
+            radius: pose.radius,
+            yaw: pose.yaw,
+            pitch: pose.pitch,
         }
     }
 
-    /// Apply a drag delta (CSS pixels): horizontal → yaw, vertical → pitch.
-    pub fn orbit(&mut self, dx: f32, dy: f32) {
-        self.yaw -= dx * Self::SENSITIVITY;
-        self.pitch = (self.pitch - dy * Self::SENSITIVITY).clamp(Self::PITCH_MIN, Self::PITCH_MAX);
-    }
-
-    /// Apply a wheel delta — positive `dy` (scroll down) dollies out.
-    pub fn zoom(&mut self, dy: f32) {
-        self.radius = (self.radius * (1.0 + dy * 0.001)).clamp(Self::MIN_RADIUS, Self::MAX_RADIUS);
+    /// Take main's pose (already clamped there).
+    pub fn set_pose(&mut self, pose: CameraPose) {
+        self.yaw = pose.yaw;
+        self.pitch = pose.pitch;
+        self.radius = pose.radius;
     }
 
     /// Camera world position from spherical coords (yaw 0 = looking from +Z).
@@ -135,6 +129,41 @@ impl OrbitCamera {
                 self.radius * sp,
                 self.radius * cp * cy,
             )
+    }
+}
+
+/// The last few camera poses main posted, each stamped with the time of the
+/// main frame it belongs to (absolute ms, see [`CameraMsg::Pose`]).
+///
+/// Each frame the worker draws the newest pose stamped at least half a
+/// display period before its own frame time. Main and this worker share the
+/// browser's frame clock, so that is main's PREVIOUS frame: posted a whole
+/// frame ago and certainly here, however this frame's message races the
+/// worker's callback. The newest (this frame's) pose is never used yet, which
+/// is what makes it exactly one frame of input per drawn frame.
+#[derive(Default)]
+pub struct CameraQueue {
+    poses: std::collections::VecDeque<(f64, CameraPose)>,
+}
+
+impl CameraQueue {
+    /// Poses kept; only the newest two or three can ever be chosen.
+    const KEEP: usize = 4;
+
+    fn push(&mut self, t: f64, pose: CameraPose) {
+        if self.poses.len() == Self::KEEP {
+            self.poses.pop_front();
+        }
+        self.poses.push_back((t, pose));
+    }
+
+    /// The newest pose stamped no later than `cutoff` (absolute ms), if any.
+    fn at(&self, cutoff: f64) -> Option<CameraPose> {
+        self.poses
+            .iter()
+            .rev()
+            .find(|(t, _)| *t <= cutoff)
+            .map(|(_, pose)| *pose)
     }
 }
 
@@ -223,14 +252,14 @@ async fn run(
     // live immediately (messages received with no listener are dropped, not
     // queued — main starts posting resize/input as soon as it has spawned us) ─
     let input: SharedInput = Rc::new(Input::new());
-    // Initial framing: head-on from +Z, tilted ~26° down, looking above the table.
+    // Initial framing: looking just above the table, from main's start pose.
     #[allow(clippy::arc_with_non_send_sync)]
     let camera: SharedCamera = Rc::new(RefCell::new(OrbitCamera::new(
         Vec3::new(0.0, 0.4, 0.0),
-        9.0,
-        0.0,
-        0.46,
+        CameraPose::START,
     )));
+    #[allow(clippy::arc_with_non_send_sync)]
+    let camera_queue: SharedCameraQueue = Rc::new(RefCell::new(CameraQueue::default()));
     #[allow(clippy::arc_with_non_send_sync)]
     let drops: DropQueue = Rc::new(RefCell::new(Vec::new()));
     // Runtime Settings AA changes only — the STARTUP config goes straight into
@@ -243,7 +272,7 @@ async fn run(
     install_message_handler(
         canvas.clone(),
         input.clone(),
-        camera.clone(),
+        camera_queue.clone(),
         drops.clone(),
         pending_aa.clone(),
     );
@@ -461,6 +490,11 @@ async fn run(
     // Per-frame carried state (owned by the FnMut closure).
     let mut accumulator: f64 = 0.0;
     let mut last_vsync: Option<f64> = None;
+    // For choosing the camera pose (see `CameraQueue`): this worker's time
+    // origin, to put its frame times on main's absolute clock, and a smoothed
+    // display period.
+    let time_origin = perf.time_origin();
+    let mut period_ms: f64 = 1000.0 / 60.0;
     let mut frame_count: u32 = 0;
     let mut cues: Vec<AudioMsg> = Vec::new();
     let mut ball_bindings: Vec<awsm_renderer::buffer::shared_arena::SlotBinding> = Vec::new();
@@ -536,6 +570,18 @@ async fn run(
             return;
         };
         let work_t0 = perf.now();
+
+        // 0. ── Camera: main's pose from its previous frame (see CameraQueue) ─
+        if let Some(prev) = last_vsync {
+            let gap = vsync_ms - prev;
+            if gap > 0.0 && gap < MAX_FRAME_MS {
+                period_ms += (gap - period_ms) * PERIOD_EMA_ALPHA;
+            }
+        }
+        let cutoff = time_origin + vsync_ms - 0.5 * period_ms;
+        if let Some(pose) = camera_queue.borrow().at(cutoff) {
+            camera.borrow_mut().set_pose(pose);
+        }
 
         // 1. ── Drain click-drops: unproject onto the tabletop, spawn a ball ──
         if let Some((floor_he, floor_tr)) = floor {
@@ -841,7 +887,7 @@ impl StatsAcc {
 fn install_message_handler(
     canvas: OffscreenCanvas,
     input: SharedInput,
-    camera: SharedCamera,
+    camera_queue: SharedCameraQueue,
     drops: DropQueue,
     pending_aa: PendingAa,
 ) {
@@ -856,11 +902,10 @@ fn install_message_handler(
             }
             return;
         }
-        if let Ok(msg) = serde_wasm_bindgen::from_value::<CameraMsg>(data.clone()) {
-            match msg {
-                CameraMsg::Orbit { dx, dy } => camera.borrow_mut().orbit(dx, dy),
-                CameraMsg::Zoom { dy } => camera.borrow_mut().zoom(dy),
-            }
+        if let Ok(CameraMsg::Pose { t, pose }) =
+            serde_wasm_bindgen::from_value::<CameraMsg>(data.clone())
+        {
+            camera_queue.borrow_mut().push(t, pose);
             return;
         }
         if let Ok(DropMsg::Ball { ndc_x, ndc_y }) =

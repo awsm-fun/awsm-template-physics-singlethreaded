@@ -95,13 +95,14 @@ by `postMessage` (see [Data flow](#data-flow)).
 ### Data flow
 
 The two threads **share nothing** — every crossing is a `postMessage` on a cold
-path (input events, layout changes, audio cues, ~1 Hz stats), never per-frame
-render data:
+path (input events, layout changes, audio cues, ~1 Hz stats, and the camera
+pose at most once per main frame while it moves), never per-frame render data:
 
 ```
   main thread                                worker thread
   ───────────                                ─────────────
-  DOM key/pointer ──▶ InputMsg / CameraMsg / DropMsg ──▶ Input + OrbitCamera + drop queue
+  DOM key/pointer ──▶ InputMsg / DropMsg ─────────────▶ Input + drop queue
+  CameraPose (rAF) ─▶ CameraMsg::Pose ───────────────▶ CameraQueue → OrbitCamera
   ResizeObserver  ──▶ ResizeMsg  ────────────────────▶ resize the OffscreenCanvas
   Settings UI     ──▶ QualityMsg ────────────────────▶ pending AA (applied off the render path)
   WebAudio player ◀── AudioMsg ◀──┐
@@ -110,10 +111,21 @@ render data:
                                                → interpolate poses → write arena → render
 ```
 
-Both threads integrate the **same** camera yaw from the **same** orbit deltas
-with the **same** `CAMERA_ORBIT_SENSITIVITY` — the worker to aim the view, main
-to orbit the audio listener — so the visual and the stereo image stay in
-lockstep **without ever exchanging the angle**.
+**The camera is owned by main.** Right-drag and the wheel change main's
+`CameraPose` (with the pitch and zoom limits), and the audio listener follows
+its yaw at once. Main posts the pose from its own `requestAnimationFrame`,
+stamped with that frame's time, once per frame while it changes. Forwarding
+each pointer event as it came would not do: the worker's frames are not in step
+with when its messages arrive, so some frames would get no movement and the
+next two, and the orbit would judder. Each frame the worker instead draws the
+newest pose stamped at least half a display period before its own frame time —
+main's previous frame, which has certainly arrived — so every drawn frame gets
+exactly one frame of input, one frame (≈17 ms at 60 Hz) behind.
+
+**Every key press is simulated.** Held keys are a level the steps poll, so a
+tap that goes down and up between two steps would be missed; each key going
+down is also latched until the next step reads it, so even the shortest tap
+moves the ball for at least one step.
 
 Because physics and rendering share one thread and one clock, the classic
 fixed-timestep interpolation is **exact**: physics keeps just a **prev/curr

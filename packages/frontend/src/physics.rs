@@ -336,7 +336,7 @@ impl World {
 
         // ── Apply input before stepping (polled from the shared block) ──────
         unsafe {
-            let held = input.held();
+            let held = input.held_for_step();
             let mut dir = v3(0.0, 0.0, 0.0);
             if held & HELD_FORWARD != 0 {
                 dir.z -= 1.0;
