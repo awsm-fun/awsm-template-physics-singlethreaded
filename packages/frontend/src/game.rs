@@ -659,6 +659,7 @@ async fn run(
         let frame_ms_work = perf.now() - work_t0;
         stats.record(
             perf.now(),
+            vsync_ms,
             frame_ms_work,
             substeps,
             step_ms,
@@ -700,6 +701,11 @@ struct StatsAcc {
     /// Consecutive windows with no GPU sample (see `StatsMsg::gpu_unavailable`).
     gpu_empty_windows: u32,
     balls: u32,
+    /// The previous presented frame's rAF timestamp, and this window's frame
+    /// span (see `StatsMsg::span_ms`).
+    last_vsync: Option<f64>,
+    span_frames: u32,
+    span_ms: f64,
 }
 
 /// The renderer's cumulative GPU frame timing as `(total_ms, samples)`.
@@ -724,11 +730,26 @@ impl StatsAcc {
             gpu_ms_ema: None,
             gpu_empty_windows: 0,
             balls: 0,
+            last_vsync: None,
+            span_frames: 0,
+            span_ms: 0.0,
         }
     }
 
-    fn record(&mut self, now: f64, frame_ms: f64, substeps: u32, step_ms: f64, balls: u32) {
+    fn record(
+        &mut self,
+        now: f64,
+        vsync_ms: f64,
+        frame_ms: f64,
+        substeps: u32,
+        step_ms: f64,
+        balls: u32,
+    ) {
         self.balls = balls;
+        let interval = self
+            .last_vsync
+            .replace(vsync_ms)
+            .map(|prev| vsync_ms - prev);
         // Discard boot frames entirely (don't even start the window on them).
         if self.warmed < STATS_WARMUP_FRAMES {
             self.warmed += 1;
@@ -738,7 +759,13 @@ impl StatsAcc {
             self.frame_ms_sum = 0.0;
             self.step_ms_sum = 0.0;
             self.gpu_prev = gpu_totals();
+            self.span_frames = 0;
+            self.span_ms = 0.0;
             return;
+        }
+        if let Some(d) = interval.filter(|d| (0.0..crate::refresh::MAX_INTERVAL_MS).contains(d)) {
+            self.span_frames += 1;
+            self.span_ms += d;
         }
         self.frames += 1;
         self.steps += substeps;
@@ -795,7 +822,11 @@ impl StatsAcc {
             step_ms: step_ms as f32,
             sps: sps as f32,
             balls: self.balls,
+            span_frames: self.span_frames,
+            span_ms: self.span_ms,
         });
+        self.span_frames = 0;
+        self.span_ms = 0.0;
         self.window_t0 = now;
         self.frames = 0;
         self.steps = 0;

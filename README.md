@@ -220,6 +220,16 @@ ms-per-step: the **worker** samples its own frame/step/CPU-µs counters ~1 Hz an
 posts a `StatsMsg`; main just formats it into the panel. Toggle it with the
 bottom-left **Stats** chip.
 
+Two lines are about frame pacing. **display** is the refresh rate of the
+browser's frame clock for the window, measured by a `requestAnimationFrame`
+loop on the (light) main thread, since no web API reports it
+(`packages/frontend/src/refresh.rs`). **missed** counts display refreshes that
+went by with no new frame (the screen showed the previous frame again), per
+second and in total: with each `StatsMsg` the worker sends how many frames it
+presented and the time they spanned, and a span of `S` ms at refresh period
+`P` should hold `S / P` frames. A nonzero rate means the worker is not keeping
+up with the display; lower the resolution or the anti-aliasing.
+
 ## The build (why it's plain)
 
 This is an ordinary wasm build with a private linear memory — nothing special.

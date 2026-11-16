@@ -29,6 +29,7 @@ pub mod game;
 pub mod main_thread;
 pub mod physics;
 pub mod protocol;
+pub mod refresh;
 
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;

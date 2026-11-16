@@ -597,17 +597,22 @@ pub fn fatal(message: &str) {
     dominator::append_dom(&dominator::body(), app);
 }
 
-/// Format a [`StatsMsg`] into the panel's text block.
-fn format_stats(s: &StatsMsg) -> String {
+/// Format a [`StatsMsg`] into the panel's text block. `display` and `missed`
+/// are the main thread's own measurements (see `refresh`): the refresh rate of
+/// the browser's frame clock, and the display refreshes that went by with no
+/// new frame (the screen showed the previous one again), per second and in
+/// total.
+fn format_stats(s: &StatsMsg, display: &str, missed: &str) -> String {
     let gpu = match s.gpu_ms {
         Some(ms) => format!("{ms:.1} ms"),
         None if s.gpu_unavailable => "n/a".to_string(),
         None => "—".to_string(),
     };
     format!(
-        "engine\n  fps           {:.0}\n  gpu time      {}\n  cpu time      {:.1} ms\n  \
-         physics time  {:.2} ms\n  physics       {:.0} steps/s\n\nballs dropped  {}",
-        s.fps, gpu, s.frame_ms, s.step_ms, s.sps, s.balls
+        "engine\n  display       {}\n  fps           {:.0}\n  missed        {}\n  \
+         gpu time      {}\n  cpu time      {:.1} ms\n  physics time  {:.2} ms\n  \
+         physics       {:.0} steps/s\n\nballs dropped  {}",
+        display, s.fps, missed, gpu, s.frame_ms, s.step_ms, s.sps, s.balls
     )
 }
 
@@ -707,9 +712,14 @@ fn setup(
     // back on `GpuInfo`. Set synchronously right after spawn.
     let worker_ref: Rc<RefCell<Option<Worker>>> = Rc::new(RefCell::new(None));
 
+    // The display's refresh period, measured by a rAF loop of the main
+    // thread's own, and the missed-frame count against it (see `refresh`).
+    let refresh = crate::refresh::install(&window)?;
+    let missed = Rc::new(RefCell::new(crate::refresh::Missed::default()));
+
     // Handle messages coming back from the worker.
     let on_msg = Closure::<dyn FnMut(MessageEvent)>::new(
-        clone!(audio, status, stats, res, user_pref, res_pct, worker_ref, notice_open, aa_compile => move |e: MessageEvent| {
+        clone!(audio, status, stats, res, user_pref, res_pct, worker_ref, notice_open, aa_compile, refresh, missed => move |e: MessageEvent| {
             let data = e.data();
             // Audio cue → the WebAudio player.
             if let Ok(msg) = serde_wasm_bindgen::from_value::<AudioMsg>(data.clone()) {
@@ -720,7 +730,10 @@ fn setup(
             }
             // Sampled engine stats → the panel.
             if let Ok(msg) = serde_wasm_bindgen::from_value::<StatsMsg>(data.clone()) {
-                stats.set(format_stats(&msg));
+                let refresh = refresh.borrow();
+                let mut missed = missed.borrow_mut();
+                missed.window(msg.span_frames, msg.span_ms, refresh.period_ms());
+                stats.set(format_stats(&msg, &refresh.line(), &missed.line()));
                 return;
             }
             match serde_wasm_bindgen::from_value::<RenderMsg>(data) {
@@ -781,6 +794,11 @@ fn setup(
 
     // Keyboard → InputMsg; a keypress also starts audio.
     install_keyboard(&window, worker.clone(), audio.clone())?;
+    // Ask for keyboard focus up front, so W/A/S/D work without a click first.
+    // At the top level this is a no-op; in a cross-origin iframe the browser
+    // only allows it once the parent has focused the frame (the awsm.fun
+    // shell does), and otherwise the first press on the canvas does it.
+    let _ = window.focus();
     // Canvas layout size → ResizeMsg (backing store in device pixels).
     install_resize(
         &window,
@@ -1023,8 +1041,13 @@ fn install_pointer(
 
     // pointerdown: the RIGHT button begins an orbit drag; a touch begins a
     // possible swipe. Any button is a user gesture → start audio.
+    let focus_window = window.clone();
     let down = Closure::<dyn FnMut(web_sys::PointerEvent)>::new(
         clone!(dragging, audio, swipe => move |e: web_sys::PointerEvent| {
+            // Keyboard focus to this page. On awsm.fun it runs inside an
+            // iframe, and keys go to whichever frame has focus: a press on the
+            // canvas must bring W/A/S/D here, not leave them with the parent.
+            let _ = focus_window.focus();
             if e.button() == 2 {
                 dragging.set(true);
             }

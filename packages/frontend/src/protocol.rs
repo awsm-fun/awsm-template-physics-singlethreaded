@@ -339,4 +339,13 @@ pub struct StatsMsg {
     pub sps: f32,
     /// Balls dropped so far.
     pub balls: u32,
+    /// Frames counted in [`Self::span_ms`] this window (raw, not smoothed):
+    /// main divides the span by the display's refresh period to tell how
+    /// many refreshes went by with no new frame (see `refresh::Missed`).
+    pub span_frames: u32,
+    /// The time this window's `span_frames` covered: the sum of the intervals
+    /// between their rAF timestamps and the previous presented frame's, in ms.
+    /// Intervals longer than `refresh::MAX_INTERVAL_MS` (a hidden tab) are
+    /// left out together with their frame.
+    pub span_ms: f64,
 }
