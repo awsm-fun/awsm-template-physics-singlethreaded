@@ -585,9 +585,9 @@ impl Stats {
             let headroom = budget - largest;
             over = headroom < 0.0;
             if over {
-                headline += &format!(" · over by {} ms", ms_1dp(-headroom));
+                headline += &format!(" · over by {:.1} ms", -headroom);
             } else {
-                headline += &format!(" · headroom {} ms", ms_1dp(headroom));
+                headline += &format!(" · headroom {headroom:.1} ms");
             }
         }
         let mut rows: Vec<Row> = lanes
@@ -597,7 +597,7 @@ impl Stats {
         if let Some(gpu) = gpu {
             rows.push(row(
                 "latency (renderer + GPU), reference only",
-                format!("{} ms", ms_1dp(f64::from(msg.renderer_ms) + gpu)),
+                format!("{:.1} ms", f64::from(msg.renderer_ms) + gpu),
             ));
         }
         self.panel.set_bad(Group::Budget, headline, rows, over);
