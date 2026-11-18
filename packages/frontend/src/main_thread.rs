@@ -64,8 +64,10 @@ const FALLBACK_START_SCALE: f64 = 0.5;
 const DEFAULT_PIXEL_BUDGET: f64 = 2_800_000.0;
 /// Max 2D texture dimension assumed until the worker reports the real one.
 const DEFAULT_MAX_TEX: u32 = 8192;
-/// `localStorage` key for the persisted user choice.
-const RES_STORAGE_KEY: &str = "awsm_res_scale";
+/// `localStorage` key for the persisted user choice. Every experiment is served
+/// from the same origin (awsm.fun), so each app's keys carry its own prefix;
+/// change it when starting a new project from this template.
+const RES_STORAGE_KEY: &str = "awsm_box3d_st_res_scale";
 
 /// Everything needed to size the canvas backing store: the user's `scale`
 /// fraction, the GPU's texture-dimension cap, and the current CSS size + DPR
@@ -158,13 +160,13 @@ fn store_scale(window: &web_sys::Window, scale: f64) {
 // MSAA+SMAA together isn't offered: on top of a 4× MSAA resolve SMAA buys
 // almost nothing (the renderer itself defaults it off) and costs an extra
 // full-screen pre-pass. SMAA earns its place as the cheap AA when MSAA is off.
-const AA_STORAGE_KEY: &str = "awsm_aa";
+const AA_STORAGE_KEY: &str = "awsm_box3d_st_aa";
 /// The pre-0.42 per-toggle keys — migrated to [`AA_STORAGE_KEY`] once, then
 /// cleared (see [`clear_legacy_aa`]).
 const LEGACY_AA_STORAGE_KEYS: [&str; 2] = ["awsm_msaa", "awsm_smaa"];
 /// `localStorage` key for the stats-panel toggle (default OFF — the panel eats a
 /// lot of a phone screen, so it's opt-in via the bottom-left Stats chip).
-const STATS_STORAGE_KEY: &str = "awsm_stats";
+const STATS_STORAGE_KEY: &str = "awsm_box3d_st_stats";
 /// The anti-aliasing modes the Settings modal offers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AaMode {
