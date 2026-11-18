@@ -22,6 +22,7 @@
 //!   worker ──(RenderMsg: progress / ready / gpu-info / error)──▶ main
 //!   worker ──(AudioMsg: roll / wall-hit / land / clack)──▶ main ──▶ WebAudio
 //!   worker ──(StatsMsg, ~1 Hz)──▶ main ──▶ stats panel
+//!   main ──(StatsDetailMsg, on a panel toggle)──▶ worker
 //! ```
 //!
 //! Every crossing is a `postMessage` on a cold path (input events, layout
@@ -381,6 +382,29 @@ pub enum RenderMsg {
     Error { message: String },
 }
 
+/// The Stats panel's breakdowns that cost something to measure, as bits in a
+/// [`StatsDetailMsg`]: main sets a group's bit while that group is expanded
+/// (and the panel open), and the worker measures the breakdown only then.
+pub const DETAIL_GPU: u32 = 1 << 0;
+pub const DETAIL_RENDERER: u32 = 1 << 1;
+pub const DETAIL_PHYSICS: u32 = 1 << 2;
+
+/// Main → worker: which Stats breakdowns to measure (`DETAIL_*` bits). Posted
+/// when a group is toggled or the panel shown/hidden, and again on `Ready`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "stats-detail", rename_all = "kebab-case")]
+pub enum StatsDetailMsg {
+    Set { bits: u32 },
+}
+
+/// One row of a breakdown: a mean in ms per frame (or per step, for the
+/// physics phases), smoothed like the headline numbers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimingMean {
+    pub name: String,
+    pub ms: f64,
+}
+
 /// Worker → main: sampled engine stats (~1 Hz) for the top-right panel. The
 /// worker owns the per-frame data, so it computes the smoothed rates and posts
 /// finished numbers; main only formats them.
@@ -396,8 +420,9 @@ pub struct StatsMsg {
     /// True once enough windows have passed with no GPU sample that the
     /// device evidently can't time the GPU (the panel then says `n/a`).
     pub gpu_unavailable: bool,
-    /// Avg render CPU ms per frame (workload metric, monitor-independent).
-    pub frame_ms: f32,
+    /// Avg renderer CPU ms per frame: the worker's frame minus its physics
+    /// steps, so it and `step_ms × steps` never count the same time twice.
+    pub renderer_ms: f32,
     /// Avg physics CPU ms per fixed step.
     pub step_ms: f32,
     /// Fixed steps per second (locked to `SIM_HZ` when healthy).
@@ -413,4 +438,14 @@ pub struct StatsMsg {
     /// Intervals longer than `refresh::MAX_INTERVAL_MS` (a hidden tab) are
     /// left out together with their frame.
     pub span_ms: f64,
+    /// The breakdowns main asked for (see [`StatsDetailMsg`]); empty
+    /// otherwise. The renderer's phases in their fixed order, ms per frame,
+    /// then what timing its passes adds to the average frame.
+    pub renderer_phases: Vec<TimingMean>,
+    /// awsm-renderer's CPU time per pass, ms per frame it was timed on.
+    pub renderer_passes: Vec<TimingMean>,
+    /// The GPU's time per pass, ms per frame.
+    pub gpu_passes: Vec<TimingMean>,
+    /// The phases of one physics step in order, ms per step.
+    pub step_phases: Vec<TimingMean>,
 }

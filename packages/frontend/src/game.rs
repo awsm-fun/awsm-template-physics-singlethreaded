@@ -16,6 +16,9 @@
 //! 4. update the orbit camera + render,
 //! 5. post the frame's audio cues (and, ~1 Hz, sampled stats) to main.
 //!
+//! While the Stats panel asks (`StatsDetailMsg`), [`Profile`] also times the
+//! frame's phases and the steps' phases; see `profile`.
+//!
 //! ## Pacing (why this shape, for smoothest motion)
 //!
 //! Physics and render share one thread, so the pacing is the classic
@@ -43,9 +46,10 @@ use web_sys::js_sys;
 use web_sys::OffscreenCanvas;
 
 use crate::physics::{Pose, World};
+use crate::profile::{Phase, Profile};
 use crate::protocol::{
     AudioMsg, CameraMsg, CameraPose, ColliderInit, ColliderShapeMsg, DropMsg, Input, InputMsg,
-    QualityMsg, RenderMsg, ResizeMsg, StatsMsg, ROLE_FLOOR, SIM_HZ,
+    QualityMsg, RenderMsg, ResizeMsg, StatsDetailMsg, StatsMsg, ROLE_FLOOR, SIM_HZ,
 };
 
 /// Player input, held on the worker and fed by [`InputMsg`]s.
@@ -58,6 +62,8 @@ type SharedCameraQueue = Rc<RefCell<CameraQueue>>;
 type DropQueue = Rc<RefCell<Vec<(f32, f32)>>>;
 /// A pending Settings anti-aliasing change `(msaa, smaa)`, applied off the render path.
 type PendingAa = Rc<Cell<Option<(bool, bool)>>>;
+/// The Stats breakdowns main asks for (`DETAIL_*` bits, see [`StatsDetailMsg`]).
+type StatsDetail = Rc<Cell<u32>>;
 /// The self-referencing rAF callback cell (so the loop can reschedule itself).
 type RafCell = Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>>;
 
@@ -269,12 +275,14 @@ async fn run(
     // a long, silent, avoidable stall on every load for e.g. every touch
     // device, whose default is MSAA off.)
     let pending_aa: PendingAa = Rc::new(Cell::new(None));
+    let stats_detail: StatsDetail = Rc::new(Cell::new(0));
     install_message_handler(
         canvas.clone(),
         input.clone(),
         camera_queue.clone(),
         drops.clone(),
         pending_aa.clone(),
+        stats_detail.clone(),
     );
 
     // Report the GPU's capabilities up front so main can seed the resolution
@@ -287,7 +295,8 @@ async fn run(
     // `Init` — device + core GPU resources — takes visible time here.
     let mut renderer = AwsmRendererBuilder::new(gpu_builder)
         .with_anti_aliasing(aa_config(desired_aa))
-        // GPU frame timing for the stats panel's "gpu time" line: `Frame` tier
+        // GPU timing for the Stats panel's GPU group (the CPU tier is `Off`
+        // except on the frames `profile` samples while asked): `Frame` tier
         // = timestamp queries on the renderer's passes, folded into one
         // whole-frame span (cheap; silently off without `timestamp-query`).
         .with_logging(awsm_renderer::debug::AwsmRendererLogging {
@@ -499,6 +508,7 @@ async fn run(
     let mut cues: Vec<AudioMsg> = Vec::new();
     let mut ball_bindings: Vec<awsm_renderer::buffer::shared_arena::SlotBinding> = Vec::new();
     let mut stats = StatsAcc::new(perf.now());
+    let mut profile = Profile::new(perf.clone());
 
     *raf_init.borrow_mut() = Some(Closure::new(move |vsync_ms: f64| {
         // A pending Settings anti-aliasing change: apply it off the render path
@@ -570,6 +580,8 @@ async fn run(
             return;
         };
         let work_t0 = perf.now();
+        profile.begin_frame(r, stats_detail.get());
+        let mut lap_ms = work_t0;
 
         // 0. ── Camera: main's pose from its previous frame (see CameraQueue) ─
         if let Some(prev) = last_vsync {
@@ -611,20 +623,25 @@ async fn run(
         let yaw = camera.borrow().yaw;
         let mut substeps: u32 = 0;
         let step_t0 = perf.now();
+        profile.charge(Phase::ReadApp, lap_ms, step_t0);
+        let mut step_timer = profile.step_timer();
         while accumulator >= FIXED_DT_MS && substeps < MAX_SUBSTEPS {
-            world.step(&input, yaw, &mut cues);
+            world.step(&input, yaw, &mut cues, step_timer.as_deref_mut());
             accumulator -= FIXED_DT_MS;
             substeps += 1;
         }
         if substeps == MAX_SUBSTEPS {
             accumulator = 0.0; // hit the cap — drop the backlog (avoid a spiral)
         }
-        let step_ms = perf.now() - step_t0;
+        // The steps are physics time, not the renderer's: no phase gets it.
+        lap_ms = perf.now();
+        let step_ms = lap_ms - step_t0;
 
         // 3. ── Audio cues → main ─────────────────────────────────────────────
         for cue in cues.drain(..) {
             post_audio(&cue);
         }
+        lap_ms = profile.lap(Phase::SoundCues, lap_ms);
 
         // 4. ── Interpolate poses → write transforms ─────────────────────────
         // After the catch-up loop `accumulator` is the leftover fraction of a
@@ -681,6 +698,7 @@ async fn run(
                 pose_lerp(bp, bc, alpha),
             );
         }
+        lap_ms = profile.lap(Phase::ReadApp, lap_ms);
 
         // 5. ── Camera + render ──────────────────────────────────────────────
         let cam = camera.borrow();
@@ -696,20 +714,25 @@ async fn run(
         params.focus_distance = cam.radius;
         let _ = r.set_camera(view, params);
         drop(cam);
+        lap_ms = profile.lap(Phase::SetCamera, lap_ms);
         r.update_transforms();
+        lap_ms = profile.lap(Phase::UpdateTransforms, lap_ms);
         if let Err(err) = r.render(None) {
             tracing::warn!("game worker: render error: {err}");
         }
+        profile.lap(Phase::Render, lap_ms);
+        profile.end_frame();
 
         // 6. ── Stats + ready signal ─────────────────────────────────────────
-        let frame_ms_work = perf.now() - work_t0;
+        let now = perf.now();
         stats.record(
-            perf.now(),
+            now,
             vsync_ms,
-            frame_ms_work,
+            now - work_t0,
             substeps,
             step_ms,
             ball_count as u32,
+            &mut profile,
         );
         frame_count = frame_count.wrapping_add(1);
         if frame_count == 3 {
@@ -729,16 +752,20 @@ async fn run(
 /// Accumulates per-frame timings on the worker and posts a smoothed [`StatsMsg`]
 /// to main ~1 Hz (main owns the panel but not the data). Counting waits out
 /// [`STATS_WARMUP_FRAMES`] so cold-start samples don't pollute the EMAs.
+///
+/// Renderer and physics share this thread, so the frame is split, never
+/// double counted: physics is the time inside the step loop, the renderer
+/// everything else the frame does.
 struct StatsAcc {
     window_t0: f64,
     frames: u32,
     steps: u32,
-    frame_ms_sum: f64,
+    renderer_ms_sum: f64,
     step_ms_sum: f64,
     warmed: u32,
     fps_ema: Option<f64>,
     sps_ema: Option<f64>,
-    frame_ms_ema: Option<f64>,
+    renderer_ms_ema: Option<f64>,
     step_ms_ema: Option<f64>,
     /// The renderer's cumulative GPU frame timing `(total_ms, samples)` at the
     /// start of the current window (`awsm_renderer::profiling::gpu_frame_timing`).
@@ -765,12 +792,12 @@ impl StatsAcc {
             window_t0: now,
             frames: 0,
             steps: 0,
-            frame_ms_sum: 0.0,
+            renderer_ms_sum: 0.0,
             step_ms_sum: 0.0,
             warmed: 0,
             fps_ema: None,
             sps_ema: None,
-            frame_ms_ema: None,
+            renderer_ms_ema: None,
             step_ms_ema: None,
             gpu_prev: None,
             gpu_ms_ema: None,
@@ -782,6 +809,9 @@ impl StatsAcc {
         }
     }
 
+    /// One frame: `frame_ms` of work on this thread, `step_ms` of it in
+    /// `substeps` physics steps.
+    #[allow(clippy::too_many_arguments)]
     fn record(
         &mut self,
         now: f64,
@@ -790,6 +820,7 @@ impl StatsAcc {
         substeps: u32,
         step_ms: f64,
         balls: u32,
+        profile: &mut Profile,
     ) {
         self.balls = balls;
         let interval = self
@@ -802,11 +833,12 @@ impl StatsAcc {
             self.window_t0 = now;
             self.frames = 0;
             self.steps = 0;
-            self.frame_ms_sum = 0.0;
+            self.renderer_ms_sum = 0.0;
             self.step_ms_sum = 0.0;
             self.gpu_prev = gpu_totals();
             self.span_frames = 0;
             self.span_ms = 0.0;
+            profile.discard_window();
             return;
         }
         if let Some(d) = interval.filter(|d| (0.0..crate::refresh::MAX_INTERVAL_MS).contains(d)) {
@@ -815,7 +847,7 @@ impl StatsAcc {
         }
         self.frames += 1;
         self.steps += substeps;
-        self.frame_ms_sum += frame_ms;
+        self.renderer_ms_sum += frame_ms - step_ms;
         self.step_ms_sum += step_ms;
         let dt = now - self.window_t0;
         if dt < 1000.0 {
@@ -829,9 +861,9 @@ impl StatsAcc {
         let secs = dt / 1000.0;
         let fps = ema(&mut self.fps_ema, self.frames as f64 / secs);
         let sps = ema(&mut self.sps_ema, self.steps as f64 / secs);
-        let frame_ms = ema(
-            &mut self.frame_ms_ema,
-            self.frame_ms_sum / self.frames.max(1) as f64,
+        let renderer_ms = ema(
+            &mut self.renderer_ms_ema,
+            self.renderer_ms_sum / self.frames.max(1) as f64,
         );
         let step_ms = ema(
             &mut self.step_ms_ema,
@@ -860,23 +892,28 @@ impl StatsAcc {
                 self.gpu_ms_ema
             }
         };
+        let breakdown = profile.window();
         post_stats(&StatsMsg {
             fps: fps as f32,
             gpu_ms: gpu_ms.map(|v| v as f32),
             gpu_unavailable: self.gpu_ms_ema.is_none() && self.gpu_empty_windows >= 3,
-            frame_ms: frame_ms as f32,
+            renderer_ms: renderer_ms as f32,
             step_ms: step_ms as f32,
             sps: sps as f32,
             balls: self.balls,
             span_frames: self.span_frames,
             span_ms: self.span_ms,
+            renderer_phases: breakdown.renderer_phases,
+            renderer_passes: breakdown.renderer_passes,
+            gpu_passes: breakdown.gpu_passes,
+            step_phases: breakdown.step_phases,
         });
         self.span_frames = 0;
         self.span_ms = 0.0;
         self.window_t0 = now;
         self.frames = 0;
         self.steps = 0;
-        self.frame_ms_sum = 0.0;
+        self.renderer_ms_sum = 0.0;
         self.step_ms_sum = 0.0;
     }
 }
@@ -890,6 +927,7 @@ fn install_message_handler(
     camera_queue: SharedCameraQueue,
     drops: DropQueue,
     pending_aa: PendingAa,
+    stats_detail: StatsDetail,
 ) {
     let scope = js_sys::global().unchecked_into::<web_sys::DedicatedWorkerGlobalScope>();
     let cb = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |e: web_sys::MessageEvent| {
@@ -924,9 +962,15 @@ fn install_message_handler(
             return;
         }
         if let Ok(QualityMsg::AntiAlias { msaa, smaa }) =
-            serde_wasm_bindgen::from_value::<QualityMsg>(data)
+            serde_wasm_bindgen::from_value::<QualityMsg>(data.clone())
         {
             pending_aa.set(Some((msaa, smaa)));
+            return;
+        }
+        if let Ok(StatsDetailMsg::Set { bits }) =
+            serde_wasm_bindgen::from_value::<StatsDetailMsg>(data)
+        {
+            stats_detail.set(bits);
         }
     });
     scope.set_onmessage(Some(cb.as_ref().unchecked_ref()));

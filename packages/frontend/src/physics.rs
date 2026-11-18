@@ -31,6 +31,7 @@ use std::ffi::c_void;
 use box3d_sys as b3;
 use wasm_bindgen::prelude::*;
 
+use crate::profile::{StepPhase, StepTimer};
 use crate::protocol::{
     AudioMsg, ColliderInit, ColliderShapeMsg, Input, HELD_BACK, HELD_FORWARD, HELD_LEFT,
     HELD_RIGHT, MAX_BALLS, ROLE_BALL, ROLE_FLOOR, ROLE_WALL, SIM_HZ,
@@ -331,7 +332,17 @@ impl World {
     /// Advance the world one fixed step: apply input, step Box3D, classify
     /// contacts/hits into `cues`, and roll the prev/curr pose buffers forward.
     /// `camera_yaw` rotates the roll/fling input so W/A/S/D stay view-relative.
-    pub fn step(&mut self, input: &Input, camera_yaw: f32, cues: &mut Vec<AudioMsg>) {
+    /// `timer` times the step's phases for the Stats panel (only while asked).
+    pub fn step(
+        &mut self,
+        input: &Input,
+        camera_yaw: f32,
+        cues: &mut Vec<AudioMsg>,
+        mut timer: Option<&mut StepTimer>,
+    ) {
+        if let Some(t) = timer.as_deref_mut() {
+            t.begin();
+        }
         self.tick = self.tick.wrapping_add(1);
 
         // ── Apply input before stepping (polled from the shared block) ──────
@@ -406,7 +417,10 @@ impl World {
             }
         }
 
+        lap(&mut timer, StepPhase::Input);
+
         unsafe { b3::b3World_Step(self.world, FIXED_DT_SECS, SUB_STEPS) };
+        lap(&mut timer, StepPhase::Box3dStep);
 
         // ── Player ball: fall-through safety net, then publish pose ─────────
         let mut teleported = false;
@@ -497,6 +511,8 @@ impl World {
             });
         }
 
+        lap(&mut timer, StepPhase::Contacts);
+
         // Roll the player's prev/curr buffer (snap on teleport so the render side
         // never interpolates across the respawn).
         self.player_prev = if teleported {
@@ -524,6 +540,7 @@ impl World {
             };
             self.ball_curr[i] = pose;
         }
+        lap(&mut timer, StepPhase::Poses);
     }
 
     /// The player ball's `(prev, curr)` poses for interpolation.
@@ -539,6 +556,13 @@ impl World {
     /// A dropped ball's `(prev, curr)` poses for interpolation.
     pub fn ball_poses(&self, index: usize) -> (Pose, Pose) {
         (self.ball_prev[index], self.ball_curr[index])
+    }
+}
+
+/// One lap of a step's [`StepTimer`], when there is one.
+fn lap(timer: &mut Option<&mut StepTimer>, phase: StepPhase) {
+    if let Some(t) = timer {
+        t.lap(phase);
     }
 }
 

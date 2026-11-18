@@ -105,6 +105,7 @@ pose at most once per main frame while it moves), never per-frame render data:
   CameraPose (rAF) ─▶ CameraMsg::Pose ───────────────▶ CameraQueue → OrbitCamera
   ResizeObserver  ──▶ ResizeMsg  ────────────────────▶ resize the OffscreenCanvas
   Settings UI     ──▶ QualityMsg ────────────────────▶ pending AA (applied off the render path)
+  Stats groups    ──▶ StatsDetailMsg ────────────────▶ which breakdowns to time
   WebAudio player ◀── AudioMsg ◀──┐
   loading / status ◀── RenderMsg ◀┤          game loop, each rAF frame:
   stats panel     ◀── StatsMsg ◀──┘            drain drops → step World × N (fixed dt)
@@ -227,20 +228,43 @@ bundle itself downloads/compiles — "loading code…"), then streams every load
 phase as it happens (streamed from the worker as `RenderMsg::Progress`): device
 creation, the scene fetch, each `awsm-renderer` loader phase
 (materials/meshes/textures/pipelines), the GPU commit stats, and the audio load.
-The top-right stats panel shows fps / steps-per-second / ms-per-frame /
-ms-per-step: the **worker** samples its own frame/step/CPU-µs counters ~1 Hz and
-posts a `StatsMsg`; main just formats it into the panel. Toggle it with the
-bottom-left **Stats** chip.
 
-Two lines are about frame pacing. **display** is the refresh rate of the
-browser's frame clock for the window, measured by a `requestAnimationFrame`
-loop on the (light) main thread, since no web API reports it
-(`packages/frontend/src/refresh.rs`). **missed** counts display refreshes that
-went by with no new frame (the screen showed the previous frame again), per
-second and in total: with each `StatsMsg` the worker sends how many frames it
-presented and the time they spanned, and a span of `S` ms at refresh period
-`P` should hold `S / P` frames. A nonzero rate means the worker is not keeping
-up with the display; lower the resolution or the anti-aliasing.
+The top-right **Stats** panel (bottom-left **Stats** button;
+`packages/frontend/src/stats.rs`) has one collapsible group per thread, so
+every number sits under the thread that spent it, with its unit and its basis
+(`/ frame`, `/ step`, `/ s`):
+
+- **display**: the refresh rate of the browser's frame clock, measured by a
+  `requestAnimationFrame` loop on the (light) main thread since no web API
+  reports it (`packages/frontend/src/refresh.rs`); frames presented per
+  second; and **missed frames**, refreshes that went by with no new frame
+  (with each `StatsMsg` the worker sends how many frames it presented and the
+  time they spanned; a span of `S` ms at refresh period `P` should hold
+  `S / P` frames). Nonzero means the worker is not keeping up with the
+  display: lower the resolution or the anti-aliasing.
+- **GPU**: GPU time per frame from timestamp queries (`n/a` without
+  `timestamp-query`); expanded, one row per pass, slowest first. On Apple
+  GPUs passes overlap, so the rows add up to more than the frame: expected.
+- **renderer (game worker)** and **physics (Box3D, game worker)**: both run
+  in the worker's one loop, so its frame is split, never double counted:
+  physics is the time inside the fixed-step loop (per step), the renderer
+  everything else the frame does (per frame). Expanded, the renderer shows
+  its phases (read app state + interpolate, update transforms, set camera,
+  render with awsm-renderer's per-pass CPU time nested under it, post sound
+  cues, timing the passes); physics shows steps/s, the step's phases (apply input, Box3D step,
+  contacts + sound cues, update poses) and the balls dropped.
+- **page (main thread)**: this thread's own per-frame work (its camera frame
+  loop and the sound cues it plays).
+
+Groups start collapsed and remember their state (`awsm_box3d_st_stats_open_<id>`;
+`?reset` clears it). The worker samples its own counters and posts a smoothed
+`StatsMsg` ~1 Hz. Expanding a group is what turns on its breakdown: main
+posts a `StatsDetailMsg`, and only then does the worker time its phases,
+sample awsm-renderer's per-pass CPU timing, or pass on the per-pass GPU
+times. The renderer's per-pass CPU timers are expensive in a worker, so they
+run on one frame in sixteen (`SubFrame`; `Off` otherwise and whenever
+collapsed), and what they add to the average frame is listed as "timing the
+passes".
 
 ## The build (why it's plain)
 

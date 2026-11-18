@@ -9,7 +9,8 @@
 //!    [`DropMsg`]; forward Settings + layout changes as [`QualityMsg`]/
 //!    [`ResizeMsg`].
 //! 4. Play back the worker's [`AudioMsg`] cues on the WebAudio player, and show
-//!    its [`RenderMsg`]/[`StatsMsg`] on the loading screen + stats panel.
+//!    its [`RenderMsg`]/[`StatsMsg`] on the loading screen + stats panel
+//!    (see `stats`).
 //!
 //! The main thread never renders or steps physics — so heavy frames in the
 //! worker can't jank input or audio, and vice versa. Nothing is shared but
@@ -32,9 +33,10 @@ use web_sys::{
 use crate::audio::AudioController;
 use crate::bootstrap::spawn_worker;
 use crate::protocol::{
-    AudioMsg, CameraMsg, CameraPose, DropMsg, InputMsg, QualityMsg, RenderMsg, ResizeMsg, StatsMsg,
-    HELD_BACK, HELD_FORWARD, HELD_LEFT, HELD_RIGHT,
+    AudioMsg, CameraMsg, CameraPose, DropMsg, InputMsg, QualityMsg, RenderMsg, ResizeMsg,
+    StatsDetailMsg, StatsMsg, HELD_BACK, HELD_FORWARD, HELD_LEFT, HELD_RIGHT,
 };
+use crate::stats::{PageWork, Panel, Stats};
 
 /// Shared, lazily-loaded audio. `None` until the export finishes loading; stays
 /// silent until a user gesture starts it (browser autoplay policy).
@@ -130,7 +132,7 @@ fn initial_auto_cap(window: &web_sys::Window) -> f64 {
 
 /// A touch / `pointer: coarse` device (phones, tablets) — the device class that
 /// seeds lower graphics defaults. Only DEFAULTS — a stored user choice wins.
-fn coarse_pointer(window: &web_sys::Window) -> bool {
+pub(crate) fn coarse_pointer(window: &web_sys::Window) -> bool {
     window
         .match_media("(pointer: coarse)")
         .ok()
@@ -166,7 +168,8 @@ const AA_STORAGE_KEY: &str = "awsm_box3d_st_aa";
 const LEGACY_AA_STORAGE_KEYS: [&str; 2] = ["awsm_msaa", "awsm_smaa"];
 /// `localStorage` key for the stats-panel toggle (default OFF — the panel eats a
 /// lot of a phone screen, so it's opt-in via the bottom-left Stats chip).
-const STATS_STORAGE_KEY: &str = "awsm_box3d_st_stats";
+/// Each panel group's open state is stored under it too (see `stats`).
+pub(crate) const STATS_STORAGE_KEY: &str = "awsm_box3d_st_stats";
 /// The anti-aliasing modes the Settings modal offers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AaMode {
@@ -262,7 +265,7 @@ fn clear_legacy_aa(window: &web_sys::Window) {
 }
 
 /// Read a persisted boolean setting (`"1"`/`"0"`), `None` if unset.
-fn stored_bool(window: &web_sys::Window, key: &str) -> Option<bool> {
+pub(crate) fn stored_bool(window: &web_sys::Window, key: &str) -> Option<bool> {
     let ls = window.local_storage().ok().flatten()?;
     match ls.get_item(key).ok().flatten()?.as_str() {
         "1" => Some(true),
@@ -272,7 +275,7 @@ fn stored_bool(window: &web_sys::Window, key: &str) -> Option<bool> {
 }
 
 /// Persist a boolean setting.
-fn store_bool(window: &web_sys::Window, key: &str, val: bool) {
+pub(crate) fn store_bool(window: &web_sys::Window, key: &str, val: bool) {
     if let Ok(Some(ls)) = window.local_storage() {
         let _ = ls.set_item(key, if val { "1" } else { "0" });
     }
@@ -301,6 +304,9 @@ fn maybe_reset_settings(window: &web_sys::Window) {
         ] {
             let _ = ls.remove_item(key);
         }
+        for key in crate::stats::open_keys() {
+            let _ = ls.remove_item(&key);
+        }
     }
     loading_log("?reset — stored settings cleared, booting with defaults");
 }
@@ -324,15 +330,9 @@ pub fn start() -> Result<(), JsValue> {
         maybe_reset_settings(&window);
     }
     let status = Mutable::new("booting…".to_string());
-    let stats = Mutable::new(String::new());
+    // The Stats panel (hidden by default; see `stats`).
+    let stats = Panel::new();
     let about_open = Mutable::new(false);
-    // Stats panel visibility: OFF by default; the bottom-left Stats chip toggles
-    // it and the choice persists (never auto-open on a coarse device).
-    let stats_open = Mutable::new(
-        web_sys::window()
-            .map(|w| !coarse_pointer(&w) && stored_bool(&w, STATS_STORAGE_KEY).unwrap_or(false))
-            .unwrap_or(false),
-    );
     loading_log("wasm compiled — booting");
 
     let app = html!("div", {
@@ -352,35 +352,14 @@ pub fn start() -> Result<(), JsValue> {
                 .text_signal(status.signal_cloned())
             }))
         }))
-        .child(html!("div", {
-            .class("stats")
-            .visible_signal(stats_open.signal())
-            .text_signal(stats.signal_cloned())
-        }))
-        .child(stats_button(&stats_open))
+        .child(stats.dom())
+        .child(stats.button())
         .child(about_button(&about_open))
         .child(about_modal(&about_open))
     });
 
     dominator::append_dom(&dominator::body(), app);
     Ok(())
-}
-
-/// The bottom-left "Stats" chip: toggles the top-right stats panel (hidden by
-/// default). Persists the choice like the graphics settings.
-fn stats_button(open: &Mutable<bool>) -> dominator::Dom {
-    html!("button", {
-        .class("stats-btn")
-        .class_signal("active", open.signal())
-        .text("Stats")
-        .event(clone!(open => move |_: dominator::events::Click| {
-            let next = !open.get();
-            open.set_neq(next);
-            if let Some(w) = web_sys::window() {
-                store_bool(&w, STATS_STORAGE_KEY, next);
-            }
-        }))
-    })
 }
 
 /// The one-time reduced-quality notice for touch devices.
@@ -599,31 +578,12 @@ pub fn fatal(message: &str) {
     dominator::append_dom(&dominator::body(), app);
 }
 
-/// Format a [`StatsMsg`] into the panel's text block. `display` and `missed`
-/// are the main thread's own measurements (see `refresh`): the refresh rate of
-/// the browser's frame clock, and the display refreshes that went by with no
-/// new frame (the screen showed the previous one again), per second and in
-/// total.
-fn format_stats(s: &StatsMsg, display: &str, missed: &str) -> String {
-    let gpu = match s.gpu_ms {
-        Some(ms) => format!("{ms:.1} ms"),
-        None if s.gpu_unavailable => "n/a".to_string(),
-        None => "—".to_string(),
-    };
-    format!(
-        "engine\n  display       {}\n  fps           {:.0}\n  missed        {}\n  \
-         gpu time      {}\n  cpu time      {:.1} ms\n  physics time  {:.2} ms\n  \
-         physics       {:.0} steps/s\n\nballs dropped  {}",
-        display, s.fps, missed, gpu, s.frame_ms, s.step_ms, s.sps, s.balls
-    )
-}
-
 /// Runs once the canvas is in the DOM: size it, transfer it to the worker, and
 /// wire input + the worker message bridge.
 fn setup(
     canvas: HtmlCanvasElement,
     status: Mutable<String>,
-    stats: Mutable<String>,
+    panel: Rc<Panel>,
 ) -> Result<(), JsValue> {
     let window = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?;
 
@@ -714,27 +674,31 @@ fn setup(
     let worker_ref: Rc<RefCell<Option<Worker>>> = Rc::new(RefCell::new(None));
 
     // The display's refresh period, measured by a rAF loop of the main
-    // thread's own, and the missed-frame count against it (see `refresh`).
+    // thread's own (see `refresh`), and this thread's own per-frame work:
+    // with the worker's `StatsMsg`s, everything the Stats panel shows.
     let refresh = crate::refresh::install(&window)?;
-    let missed = Rc::new(RefCell::new(crate::refresh::Missed::default()));
+    let page_work = Rc::new(PageWork::default());
+    let stats = Rc::new(Stats::new(panel.clone(), page_work.clone(), refresh));
+    let perf = window
+        .performance()
+        .ok_or_else(|| JsValue::from_str("no performance"))?;
 
     // Handle messages coming back from the worker.
     let on_msg = Closure::<dyn FnMut(MessageEvent)>::new(
-        clone!(audio, status, stats, res, user_pref, res_pct, worker_ref, notice_open, aa_compile, refresh, missed => move |e: MessageEvent| {
+        clone!(audio, status, stats, panel, page_work, perf, res, user_pref, res_pct, worker_ref, notice_open, aa_compile => move |e: MessageEvent| {
             let data = e.data();
             // Audio cue → the WebAudio player.
+            let t0 = perf.now();
             if let Ok(msg) = serde_wasm_bindgen::from_value::<AudioMsg>(data.clone()) {
                 if let Some(c) = audio.borrow_mut().as_mut() {
                     c.on_audio(msg);
                 }
+                page_work.cues(perf.now() - t0);
                 return;
             }
             // Sampled engine stats → the panel.
             if let Ok(msg) = serde_wasm_bindgen::from_value::<StatsMsg>(data.clone()) {
-                let refresh = refresh.borrow();
-                let mut missed = missed.borrow_mut();
-                missed.window(msg.span_frames, msg.span_ms, refresh.period_ms());
-                stats.set(format_stats(&msg, &refresh.line(), &missed.line()));
+                stats.on_stats(&msg);
                 return;
             }
             match serde_wasm_bindgen::from_value::<RenderMsg>(data) {
@@ -742,6 +706,12 @@ fn setup(
                 Ok(RenderMsg::Ready) => {
                     loading_log("first frames rendered — ready");
                     loading_done();
+                    stats.ready();
+                    // Anything posted before the worker's handler was up is
+                    // lost: tell it again what the Stats panel shows.
+                    if let Some(wk) = worker_ref.borrow().as_ref() {
+                        post(wk, &StatsDetailMsg::Set { bits: panel.detail() });
+                    }
                     status.set("playing — roll · Space jump · click drops a ball · right-drag orbit".into());
                     if show_quality_notice {
                         notice_open.set_neq(true);
@@ -792,6 +762,16 @@ fn setup(
     let worker = spawn_worker(&payload, &transfer, on_msg.as_ref().unchecked_ref())?;
     on_msg.forget();
     *worker_ref.borrow_mut() = Some(worker.clone());
+    // Tell the worker which Stats breakdowns to measure whenever a group is
+    // toggled or the panel shown/hidden.
+    spawn_local(
+        panel
+            .detail_signal()
+            .for_each(clone!(worker => move |bits| {
+                post(&worker, &StatsDetailMsg::Set { bits });
+                async {}
+            })),
+    );
 
     // Keyboard → InputMsg; a keypress also starts audio.
     install_keyboard(&window, worker.clone(), audio.clone())?;
@@ -819,7 +799,7 @@ fn setup(
         aa,
     )?;
     // Camera pose → the worker, once per main frame while it changes.
-    install_camera(&window, worker.clone(), camera.clone())?;
+    install_camera(&window, worker.clone(), camera.clone(), page_work)?;
     // Pointer: click drops a ball, right-drag orbits, wheel zooms, touch flings.
     install_pointer(&window, &canvas, worker, audio, camera)?;
 
@@ -1010,18 +990,20 @@ fn install_camera(
     window: &web_sys::Window,
     worker: Worker,
     camera: Rc<Cell<CameraPose>>,
+    page_work: Rc<PageWork>,
 ) -> Result<(), JsValue> {
     type FrameLoop = Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>>;
-    let time_origin = window
+    let perf = window
         .performance()
-        .ok_or_else(|| JsValue::from_str("no performance"))?
-        .time_origin();
+        .ok_or_else(|| JsValue::from_str("no performance"))?;
+    let time_origin = perf.time_origin();
     let cb: FrameLoop = Rc::new(RefCell::new(None));
     let next = cb.clone();
     let win = window.clone();
     // Nothing posted yet: the worker starts at the same `START` pose.
     let mut sent = CameraPose::START;
     *cb.borrow_mut() = Some(Closure::new(move |t: f64| {
+        let t0 = perf.now();
         let pose = camera.get();
         if pose != sent {
             sent = pose;
@@ -1033,6 +1015,7 @@ fn install_camera(
                 },
             );
         }
+        page_work.frame(perf.now() - t0);
         if let Some(f) = next.borrow().as_ref() {
             let _ = win.request_animation_frame(f.as_ref().unchecked_ref());
         }
@@ -1225,6 +1208,12 @@ fn install_keyboard(window: &web_sys::Window, worker: Worker, audio: Audio) -> R
             }
             let key = e.key();
             if key == " " || key == "Spacebar" {
+                // A button reached with the keyboard keeps Space: it presses
+                // the button. (One that was clicked does not: `:focus-visible`
+                // is the browser's own test for "focused from the keyboard".)
+                if on_keyboard_focused_control(&e) {
+                    return;
+                }
                 if !e.repeat() {
                     post(&worker, &InputMsg::Jump);
                 }
@@ -1247,6 +1236,16 @@ fn install_keyboard(window: &web_sys::Window, worker: Worker, audio: Audio) -> R
     up.forget();
 
     Ok(())
+}
+
+/// Whether a key event is aimed at a control that has the keyboard's focus.
+fn on_keyboard_focused_control(e: &KeyboardEvent) -> bool {
+    e.target()
+        .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+        .is_some_and(|el| {
+            el.matches("button:focus-visible, select:focus-visible, a[href]:focus-visible")
+                .unwrap_or(false)
+        })
 }
 
 /// The `HELD_*` bit a key drives (WASD or arrows). Unknown keys → `None`.
