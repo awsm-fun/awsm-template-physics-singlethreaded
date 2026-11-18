@@ -270,6 +270,11 @@ every number sits under the thread that spent it, with its unit and its basis
 - **page (main thread)**: this thread's own per-frame work (its camera frame
   loop and the sound cues it plays).
 
+The panel's `what do these mean?` button opens the **About** modal (bottom
+centre) on its **Stats** tab, which explains every group and row in plain
+words; its **About** tab has the controls and a short tour. Both are in
+`packages/frontend/src/about.rs`.
+
 Groups start collapsed and remember their state (`awsm_box3d_st_stats_open_<id>`;
 `?reset` clears it). The worker samples its own counters and posts a smoothed
 `StatsMsg` ~1 Hz. Expanding a group is what turns on its breakdown: main

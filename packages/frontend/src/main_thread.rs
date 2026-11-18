@@ -30,6 +30,7 @@ use web_sys::{
     HtmlCanvasElement, HtmlInputElement, HtmlSelectElement, KeyboardEvent, MessageEvent, Worker,
 };
 
+use crate::about::{About, Tab};
 use crate::audio::AudioController;
 use crate::bootstrap::spawn_worker;
 use crate::protocol::{
@@ -170,6 +171,8 @@ const LEGACY_AA_STORAGE_KEYS: [&str; 2] = ["awsm_msaa", "awsm_smaa"];
 /// lot of a phone screen, so it's opt-in via the bottom-left Stats chip).
 /// Each panel group's open state is stored under it too (see `stats`).
 pub(crate) const STATS_STORAGE_KEY: &str = "awsm_box3d_st_stats";
+/// The element id of the reduced-quality notice (see `quality_notice_modal`).
+pub(crate) const QUALITY_NOTICE_ID: &str = "quality-notice";
 /// The anti-aliasing modes the Settings modal offers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AaMode {
@@ -332,7 +335,7 @@ pub fn start() -> Result<(), JsValue> {
     let status = Mutable::new("booting…".to_string());
     // The Stats panel (hidden by default; see `stats`).
     let stats = Panel::new();
-    let about_open = Mutable::new(false);
+    let about = About::default();
     loading_log("wasm compiled — booting");
 
     let app = html!("div", {
@@ -352,10 +355,10 @@ pub fn start() -> Result<(), JsValue> {
                 .text_signal(status.signal_cloned())
             }))
         }))
-        .child(stats.dom())
+        .child(stats.dom(clone!(about => move || about.show(Tab::Stats))))
         .child(stats.button())
-        .child(about_button(&about_open))
-        .child(about_modal(&about_open))
+        .child(about.button())
+        .child(about.modal())
     });
 
     dominator::append_dom(&dominator::body(), app);
@@ -366,7 +369,11 @@ pub fn start() -> Result<(), JsValue> {
 fn quality_notice_modal(open: &Mutable<bool>) -> dominator::Dom {
     html!("div", {
         .class("settings-overlay")
+        .attr("id", QUALITY_NOTICE_ID)
+        // Above the About modal, which may already be open when this shows.
+        .style("z-index", "25")
         .visible_signal(open.signal())
+        .event_with_options(&dominator::EventOptions::bubbles(), keep_keys_in_modal)
         .event(clone!(open => move |e: dominator::events::Click| {
             let on_backdrop = e
                 .dyn_target::<web_sys::Element>()
@@ -429,99 +436,6 @@ fn aa_compile_modal(state: &Mutable<Option<String>>) -> dominator::Dom {
             .child(html!("p", {
                 .class("settings-hint")
                 .text_signal(state.signal_cloned().map(|s| s.unwrap_or_default()))
-            }))
-        }))
-    })
-}
-
-/// The bottom-center "About" chip.
-fn about_button(open: &Mutable<bool>) -> dominator::Dom {
-    html!("button", {
-        .class("about-btn")
-        .text("About")
-        .event(clone!(open => move |_: dominator::events::Click| {
-            open.set_neq(true);
-        }))
-    })
-}
-
-/// The About overlay: what this template is + where it lives.
-fn about_modal(open: &Mutable<bool>) -> dominator::Dom {
-    const REPO: &str = "https://github.com/awsm-fun/awsm-template-physics-singlethreaded";
-    let link = |href: &str, label: &str| {
-        html!("a", {
-            .attr("href", href)
-            .attr("target", "_blank")
-            .attr("rel", "noopener")
-            .text(label)
-        })
-    };
-    html!("div", {
-        .class("about-overlay")
-        .visible_signal(open.signal())
-        .event(clone!(open => move |e: dominator::events::Click| {
-            let on_backdrop = e
-                .dyn_target::<web_sys::Element>()
-                .map(|el| el.class_list().contains("about-overlay"))
-                .unwrap_or(false);
-            if on_backdrop {
-                open.set_neq(false);
-            }
-        }))
-        .global_event(clone!(open => move |e: dominator::events::KeyDown| {
-            if e.key() == "Escape" {
-                open.set_neq(false);
-            }
-        }))
-        .child(html!("div", {
-            .class("about-modal")
-            .child(html!("button", {
-                .class("about-close")
-                .attr("aria-label", "Close")
-                .text("×")
-                .event(clone!(open => move |_: dominator::events::Click| {
-                    open.set_neq(false);
-                }))
-            }))
-            .child(html!("h2", { .text("Single-threaded Physics Demo") }))
-            .child(html!("p", {
-                .text("A copyable template from the ")
-                .child(link("https://awsm.fun", "Awsm"))
-                .text(" project — a WebGPU game skeleton whose simulation is \
-                       single-threaded (one requestAnimationFrame loop: Box3D \
-                       physics + an awsm-renderer scene), hosted on a worker so \
-                       the main thread stays free for DOM, input, and live \
-                       synthesized audio. The two threads share nothing — just \
-                       postMessage.")
-            }))
-            .child(html!("ul", {
-                .child(html!("li", {
-                    .text("Rendering: ")
-                    .child(link("https://scene.awsm.fun", "AwsmRenderer"))
-                }))
-                .child(html!("li", {
-                    .text("Audio: ")
-                    .child(link("https://audio.awsm.fun", "AwsmAudio"))
-                }))
-                .child(html!("li", {
-                    .text("Physics: ")
-                    .child(link("https://github.com/erincatto/box3d", "Box3D"))
-                }))
-            }))
-            .child(html!("p", {
-                .text("Roll the red ball with WASD, jump with Space, click the table to \
-                       drop more balls — every impact is synthesized and spatialized in \
-                       real time from the physics contacts. Drag with the right mouse \
-                       button to orbit the camera and scroll to zoom; the controls and \
-                       the stereo image stay relative to your view from any angle.")
-            }))
-            .child(html!("p", {
-                .class("about-repo")
-                .child(link(REPO, "Source on GitHub"))
-            }))
-            .child(html!("p", {
-                .class("about-footer")
-                .text("Built with ❤ by David Komer")
             }))
         }))
     })
@@ -926,6 +840,7 @@ fn install_settings(
     let modal = html!("div", {
         .class("settings-overlay")
         .visible_signal(open.signal())
+        .event_with_options(&dominator::EventOptions::bubbles(), keep_keys_in_modal)
         .event(clone!(open => move |e: dominator::events::Click| {
             let on_backdrop = e
                 .dyn_target::<web_sys::Element>()
@@ -1236,6 +1151,19 @@ fn install_keyboard(window: &web_sys::Window, worker: Worker, audio: Audio) -> R
     up.forget();
 
     Ok(())
+}
+
+/// Keeps a key pressed inside a modal from the game's `window` listeners, so
+/// the arrows move a slider, a select or a tab and Space presses a button.
+/// Escape goes through: it closes the modal.
+///
+/// Attach it with `EventOptions::bubbles()`: dominator's plain `.event` listens
+/// in the capture phase, where stopping the key would also keep it from the
+/// controls inside the modal.
+pub(crate) fn keep_keys_in_modal(e: dominator::events::KeyDown) {
+    if e.key() != "Escape" {
+        e.stop_propagation();
+    }
 }
 
 /// Whether a key event is aimed at a control that has the keyboard's focus.

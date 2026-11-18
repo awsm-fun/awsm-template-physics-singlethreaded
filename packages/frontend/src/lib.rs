@@ -23,6 +23,7 @@
 //! `WebAssembly.Module` needs no cross-origin isolation). The simulation stays a
 //! single thread of execution, which is all this scene needs.
 
+pub mod about;
 pub mod audio;
 pub mod bootstrap;
 pub mod game;
