@@ -249,7 +249,7 @@ every number sits under the thread that spent it, with its unit and its basis
   in the worker's one loop, so its frame is split, never double counted:
   physics is the time inside the fixed-step loop (per step), the renderer
   everything else the frame does (per frame). Expanded, the renderer shows
-  its phases (read app state + interpolate, update transforms, set camera,
+  its phases (read app state + interpolate, set camera, update transforms,
   render with awsm-renderer's per-pass CPU time nested under it, post sound
   cues, timing the passes); physics shows steps/s, the step's phases (apply input, Box3D step,
   contacts + sound cues, update poses) and the balls dropped.

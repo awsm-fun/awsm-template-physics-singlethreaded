@@ -27,30 +27,33 @@
 //! * the scopes are on for one frame in [`PASS_TIMING_EVERY`] only, and the
 //!   phases are taken from the other frames, which are undisturbed;
 //! * what the scopes cost is measured, as the difference between the render
-//!   phase with and without them, and reported as a row of its own;
+//!   phase with and without them, and reported as a row of its own. One
+//!   estimate is made per stats window and the median of the last few is
+//!   used, so that a frame that hitched (a pipeline compile, a collection)
+//!   does not pass for the scopes' doing;
 //! * each pass has the scope's share of its reading taken out. A scope's
 //!   reading runs from the end of its first lookup to the end of its second,
 //!   so it contains one of the two: half of what the scope costs.
 //!
 //! [`StatsDetailMsg`]: crate::protocol::StatsDetailMsg
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use awsm_renderer::debug::TimingTier;
 use awsm_renderer::{profiling, AwsmRenderer};
 
 use crate::protocol::{TimingMean, DETAIL_GPU, DETAIL_PHYSICS, DETAIL_RENDERER};
 
-/// The renderer's phases of one frame; the Stats panel lists them by these
-/// names, in this order (the first four are the same in every template).
+/// The renderer's phases of one frame, in the order they run; the Stats
+/// panel lists them by these names.
 #[derive(Clone, Copy)]
 pub enum Phase {
     /// Everything before the transforms are resolved, minus the physics
     /// steps: the camera pose main posted, click-drops, interpolating every
     /// body and writing its transform.
     ReadApp,
-    UpdateTransforms,
     SetCamera,
+    UpdateTransforms,
     /// `AwsmRenderer::render`: encoding every pass and submitting.
     Render,
     /// Posting the steps' audio cues to main.
@@ -59,8 +62,8 @@ pub enum Phase {
 
 const PHASE_NAMES: [&str; 5] = [
     "read app state + interpolate",
-    "update transforms",
     "set camera",
+    "update transforms",
     "render (encode + submit)",
     "post sound cues",
 ];
@@ -88,6 +91,9 @@ const WHOLE_RENDER_SCOPE: &str = "Render";
 const OVERHEAD_NAME: &str = "timing the passes (only while open)";
 /// The per-pass scopes are on for one frame in this many.
 const PASS_TIMING_EVERY: u64 = 16;
+/// The scope cost in use is the median of this many estimates, one per
+/// stats window (about a second) that had frames of both kinds.
+const SCOPE_ESTIMATES: usize = 5;
 
 /// Smoothing weight of each window's mean (the same as the headline numbers).
 const EMA_ALPHA: f64 = 0.35;
@@ -135,29 +141,11 @@ fn totals(stats: Vec<(&'static str, profiling::TimingStat)>) -> Totals {
         .collect()
 }
 
-/// The render phase with and without the scopes, over everything measured
-/// so far: what one scope costs is a property of the clock lookup, not of
-/// the scene.
-#[derive(Default)]
-struct ScopeCost {
-    plain_render_ms: f64,
-    plain_frames: u64,
-    timed_render_ms: f64,
-    timed_frames: u64,
-    scope_runs: u64,
-}
-
-impl ScopeCost {
-    /// What one scope costs: what a frame with the scopes takes over one
-    /// without, shared among the scopes it ran.
-    fn per_scope_ms(&self) -> f64 {
-        if self.plain_frames == 0 || self.timed_frames == 0 || self.scope_runs == 0 {
-            return 0.0;
-        }
-        let plain_ms = self.plain_render_ms / self.plain_frames as f64;
-        let timed_ms = self.timed_render_ms / self.timed_frames as f64;
-        (timed_ms - plain_ms).max(0.0) * self.timed_frames as f64 / self.scope_runs as f64
-    }
+/// The middle value (the upper of the two for an even count), or 0 for none.
+fn median(values: &VecDeque<f64>) -> f64 {
+    let mut sorted: Vec<f64> = values.iter().copied().collect();
+    sorted.sort_by(f64::total_cmp);
+    sorted.get(sorted.len() / 2).copied().unwrap_or(0.0)
 }
 
 pub struct Profile {
@@ -178,7 +166,8 @@ pub struct Profile {
     steps: StepTimer,
     /// The renderer's per-pass `(total ms, runs)` as last seen.
     cpu_seen: Totals,
-    cost: ScopeCost,
+    /// The latest estimates of what one scope costs (ms).
+    scope_estimates: VecDeque<f64>,
     /// The GPU's per-pass totals and sampled-frame count at the window's
     /// start (`None` when they were not being collected then).
     gpu_base: Option<(u64, Totals)>,
@@ -204,7 +193,7 @@ impl Profile {
             timed_render_ms: 0.0,
             timed_frames: 0,
             cpu_seen: HashMap::new(),
-            cost: ScopeCost::default(),
+            scope_estimates: VecDeque::new(),
             gpu_base: None,
             means: HashMap::new(),
         }
@@ -304,24 +293,31 @@ impl Profile {
         };
 
         if self.renderer() {
-            let cost = &mut self.cost;
-            cost.plain_render_ms += self.phase_ms[Phase::Render as usize];
-            cost.plain_frames += u64::from(self.plain_frames);
-            cost.timed_render_ms += self.timed_render_ms;
-            cost.timed_frames += u64::from(self.timed_frames);
-
             // What the scopes ran and read this window. They only run while
             // asked, so a scope never seen before ran entirely in it.
             let stats = totals(profiling::cpu_timing_stats());
             let mut window = Vec::with_capacity(stats.len());
+            let mut scope_runs = 0.0;
             for (&name, &(total_ms, count)) in &stats {
                 let (seen_ms, seen_count) = self.cpu_seen.get(name).copied().unwrap_or_default();
-                let runs = count.saturating_sub(seen_count);
-                cost.scope_runs += runs;
-                window.push((name, runs as f64, total_ms - seen_ms));
+                let runs = count.saturating_sub(seen_count) as f64;
+                scope_runs += runs;
+                window.push((name, runs, total_ms - seen_ms));
             }
             self.cpu_seen = stats;
-            let scope_ms = cost.per_scope_ms();
+
+            // What one scope costs: what a frame with the scopes took over
+            // one without, shared among the scopes it ran.
+            if self.plain_frames > 0 && self.timed_frames > 0 && scope_runs > 0.0 {
+                let plain_ms = self.phase_ms[Phase::Render as usize] / f64::from(self.plain_frames);
+                let timed_ms = self.timed_render_ms / f64::from(self.timed_frames);
+                let estimate = (timed_ms - plain_ms) * f64::from(self.timed_frames) / scope_runs;
+                if self.scope_estimates.len() == SCOPE_ESTIMATES {
+                    self.scope_estimates.pop_front();
+                }
+                self.scope_estimates.push_back(estimate);
+            }
+            let scope_ms = median(&self.scope_estimates).max(0.0);
 
             // The phases come from the undisturbed frames, the passes from
             // the timed ones, each pass less the half of a scope its reading
