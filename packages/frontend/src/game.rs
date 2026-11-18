@@ -208,8 +208,8 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
             // across releases, so a browser that cached an older transcoder
             // (wasm included: the worker carries the query over to it) would
             // otherwise pair it with the new JS. Bump with awsm-renderer.
-            format!("{base}/workers/basis-worker.js?v=0.42.0"),
-            format!("{base}/vendor/basis/basis_transcoder.js?v=0.42.0"),
+            format!("{base}/workers/basis-worker.js?v=0.43.0"),
+            format!("{base}/vendor/basis/basis_transcoder.js?v=0.43.0"),
         ));
     }
     let get_bool = |key: &str| {
@@ -296,7 +296,7 @@ async fn run(
     let mut renderer = AwsmRendererBuilder::new(gpu_builder)
         .with_anti_aliasing(aa_config(desired_aa))
         // GPU timing for the Stats panel's GPU group (the CPU tier is `Off`
-        // except on the frames `profile` samples while asked): `Frame` tier
+        // except while the renderer group is open, see `profile`): `Frame` tier
         // = timestamp queries on the renderer's passes, folded into one
         // whole-frame span (cheap; silently off without `timestamp-query`).
         .with_logging(awsm_renderer::debug::AwsmRendererLogging {
@@ -767,6 +767,7 @@ struct StatsAcc {
     sps_ema: Option<f64>,
     renderer_ms_ema: Option<f64>,
     step_ms_ema: Option<f64>,
+    worker_ms_ema: Option<f64>,
     /// The renderer's cumulative GPU frame timing `(total_ms, samples)` at the
     /// start of the current window (`awsm_renderer::profiling::gpu_frame_timing`).
     gpu_prev: Option<(f64, u64)>,
@@ -799,6 +800,7 @@ impl StatsAcc {
             sps_ema: None,
             renderer_ms_ema: None,
             step_ms_ema: None,
+            worker_ms_ema: None,
             gpu_prev: None,
             gpu_ms_ema: None,
             gpu_empty_windows: 0,
@@ -873,6 +875,10 @@ impl StatsAcc {
                 0.0
             },
         );
+        let worker_ms = ema(
+            &mut self.worker_ms_ema,
+            (self.renderer_ms_sum + self.step_ms_sum) / self.frames.max(1) as f64,
+        );
         // Avg GPU ms per sampled frame over the window (the timestamp readback
         // skips frames while one is in flight — divide by samples, not frames).
         let gpu_now = gpu_totals();
@@ -899,12 +905,16 @@ impl StatsAcc {
             gpu_unavailable: self.gpu_ms_ema.is_none() && self.gpu_empty_windows >= 3,
             renderer_ms: renderer_ms as f32,
             step_ms: step_ms as f32,
+            worker_ms: worker_ms as f32,
             sps: sps as f32,
             balls: self.balls,
             span_frames: self.span_frames,
             span_ms: self.span_ms,
             renderer_phases: breakdown.renderer_phases,
+            renderer_prep: breakdown.renderer_prep,
             renderer_passes: breakdown.renderer_passes,
+            renderer_submit: breakdown.renderer_submit,
+            renderer_hooks: breakdown.renderer_hooks,
             gpu_passes: breakdown.gpu_passes,
             step_phases: breakdown.step_phases,
         });

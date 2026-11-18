@@ -3,6 +3,8 @@
 //! One group per thread, so every number sits under the thread that spent
 //! it, and every number says its unit and what it is per:
 //!
+//! - `frame budget`: the refresh period, and each thread's and the GPU's
+//!   time per drawn frame against it.
 //! - `display`: the refresh rate of the browser's frame clock (measured here,
 //!   see `refresh`), the frames the worker presented per second, and the
 //!   refreshes that went by with no new frame.
@@ -13,7 +15,8 @@
 //! - `renderer (game worker)` and `physics (Box3D, game worker)`: the game
 //!   worker's CPU time, split so nothing is counted twice: physics is the
 //!   time inside the fixed-step loop (per step), the renderer everything
-//!   else the worker's frame does (per frame).
+//!   else the worker's frame does (per frame). Expanded, the renderer shows
+//!   its phases and awsm-renderer's CPU scopes inside `render()`.
 //! - `page (main thread)`: this thread's own per-frame work.
 //!
 //! A group's header always shows its headline. Expanding a group shows its
@@ -42,12 +45,15 @@ use crate::refresh::{Missed, Refresh};
 /// Smoothing weight of each new sample of this thread's own work (the
 /// worker smooths its figures the same way).
 const EMA_ALPHA: f64 = 0.35;
-/// The renderer phase whose time its per-pass rows break down.
+/// The renderer phase whose time its scope rows break down.
 const RENDER_PHASE: &str = "render (encode + submit)";
+/// Scopes under this mean (ms per frame) are folded into one line.
+const FOLD_BELOW_MS: f64 = 0.001;
 
 /// The groups, top to bottom.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Group {
+    Budget,
     Display,
     Gpu,
     Renderer,
@@ -56,7 +62,8 @@ pub enum Group {
 }
 
 impl Group {
-    const ALL: [Group; 5] = [
+    const ALL: [Group; 6] = [
+        Group::Budget,
         Group::Display,
         Group::Gpu,
         Group::Renderer,
@@ -67,6 +74,7 @@ impl Group {
     /// Storage / element id.
     fn id(self) -> &'static str {
         match self {
+            Group::Budget => "budget",
             Group::Display => "display",
             Group::Gpu => "gpu",
             Group::Renderer => "renderer",
@@ -77,6 +85,7 @@ impl Group {
 
     fn label(self) -> &'static str {
         match self {
+            Group::Budget => "frame budget",
             Group::Display => "display",
             Group::Gpu => "GPU",
             Group::Renderer => "renderer (game worker)",
@@ -91,7 +100,7 @@ impl Group {
             Group::Gpu => DETAIL_GPU,
             Group::Renderer => DETAIL_RENDERER,
             Group::Physics => DETAIL_PHYSICS,
-            Group::Display | Group::Page => 0,
+            Group::Budget | Group::Display | Group::Page => 0,
         }
     }
 }
@@ -130,6 +139,27 @@ fn per_step(ms: f64) -> String {
     format!("{} / step", duration(ms))
 }
 
+/// Milliseconds with one decimal, for the frame budget: `<0.1` for a
+/// nonzero time that would print as 0.0.
+fn ms_1dp(ms: f64) -> String {
+    if ms > 0.0 && ms < 0.05 {
+        "<0.1".to_string()
+    } else {
+        format!("{ms:.1}")
+    }
+}
+
+/// A frame budget row: `7.2 / 16.7 ms (43%)`.
+fn budget_share(used_ms: f64, budget_ms: f64) -> String {
+    let pct = used_ms / budget_ms * 100.0;
+    let pct = if pct > 0.0 && pct < 1.0 {
+        "<1%".to_string()
+    } else {
+        format!("{pct:.0}%")
+    };
+    format!("{} / {budget_ms:.1} ms ({pct})", ms_1dp(used_ms))
+}
+
 fn smooth(ema: Option<f64>, value: f64) -> f64 {
     match ema {
         Some(e) => e + (value - e) * EMA_ALPHA,
@@ -137,26 +167,31 @@ fn smooth(ema: Option<f64>, value: f64) -> f64 {
     }
 }
 
-/// One row of a group: label left, value right. `nested` indents it under
-/// the row above (a breakdown of it).
+/// One row of a group: label left, value right. `depth` indents it under
+/// the row above (a breakdown of it), up to two levels.
 #[derive(Clone, PartialEq)]
 struct Row {
     label: String,
     value: String,
-    nested: bool,
+    depth: u8,
 }
 
 fn row(label: impl Into<String>, value: impl Into<String>) -> Row {
     Row {
         label: label.into(),
         value: value.into(),
-        nested: false,
+        depth: 0,
     }
 }
 
 impl Row {
     fn nested(mut self) -> Self {
-        self.nested = true;
+        self.depth = 1;
+        self
+    }
+
+    fn nested_2(mut self) -> Self {
+        self.depth = 2;
         self
     }
 }
@@ -165,6 +200,8 @@ struct GroupView {
     group: Group,
     open: Mutable<bool>,
     headline: Mutable<String>,
+    /// Turns the header red (over the frame budget).
+    bad: Mutable<bool>,
     rows: MutableVec<Row>,
 }
 
@@ -198,6 +235,7 @@ impl Panel {
                 group,
                 open: Mutable::new(stored(&open_key(group))),
                 headline: Mutable::new(String::new()),
+                bad: Mutable::new(false),
                 rows: MutableVec::new(),
             })
             .collect();
@@ -237,8 +275,13 @@ impl Panel {
     }
 
     fn set(&self, group: Group, headline: impl Into<String>, rows: Vec<Row>) {
+        self.set_bad(group, headline, rows, false);
+    }
+
+    fn set_bad(&self, group: Group, headline: impl Into<String>, rows: Vec<Row>, bad: bool) {
         let view = self.view(group);
         view.headline.set_neq(headline.into());
+        view.bad.set_neq(bad);
         let mut current = view.rows.lock_mut();
         if current[..] != rows[..] {
             current.replace_cloned(rows);
@@ -266,6 +309,7 @@ impl Panel {
                     html!("button", {
                         .attr("type", "button")
                         .class("stats-group")
+                        .class_signal("stats-bad", view.bad.signal())
                         .attr("aria-controls", &rows_id)
                         .attr_signal("aria-expanded", view.open.signal().map(|open| if open { "true" } else { "false" }))
                         .child(html!("span", {
@@ -293,7 +337,8 @@ impl Panel {
                         .children_signal_vec(view.rows.signal_vec_cloned().map(|row| {
                             html!("div", {
                                 .class("stats-row")
-                                .apply_if(row.nested, |dom| dom.class("stats-nested"))
+                                .apply_if(row.depth == 1, |dom| dom.class("stats-nested"))
+                                .apply_if(row.depth == 2, |dom| dom.class("stats-nested-2"))
                                 .child(html!("span", { .text(&row.label) }))
                                 .child(html!("span", { .text(&row.value) }))
                             })
@@ -416,28 +461,54 @@ impl Stats {
             .collect();
         panel.set(Group::Gpu, gpu, gpu_rows);
 
-        // The renderer's phases in their fixed order, with its CPU time inside
-        // each pass listed under the phase that encodes them.
-        let passes = slowest_first(&msg.renderer_passes);
+        // The renderer's phases in the order they run, with awsm-renderer's
+        // scopes inside render() grouped by kind under the render phase.
         let mut renderer_rows = Vec::new();
         for phase in &msg.renderer_phases {
             renderer_rows.push(row(&phase.name, per_frame(phase.ms)));
-            if phase.name != RENDER_PHASE || passes.is_empty() {
+            if phase.name != RENDER_PHASE {
                 continue;
             }
-            for pass in &passes {
-                renderer_rows.push(row(&pass.name, per_frame(pass.ms)).nested());
+            let mut in_scopes = None;
+            for (label, scopes) in [
+                ("prepare", &msg.renderer_prep),
+                ("passes", &msg.renderer_passes),
+                ("submit", &msg.renderer_submit),
+                ("hooks", &msg.renderer_hooks),
+            ] {
+                if scopes.is_empty() {
+                    continue;
+                }
+                let sum: f64 = scopes.iter().map(|scope| scope.ms).sum();
+                *in_scopes.get_or_insert(0.0) += sum;
+                renderer_rows.push(row(label, per_frame(sum)).nested());
+                let (shown, folded): (Vec<_>, Vec<_>) = slowest_first(scopes)
+                    .into_iter()
+                    .partition(|scope| scope.ms >= FOLD_BELOW_MS);
+                for scope in shown {
+                    renderer_rows.push(row(&scope.name, per_frame(scope.ms)).nested_2());
+                }
+                if !folded.is_empty() {
+                    let folded_ms: f64 = folded.iter().map(|scope| scope.ms).sum();
+                    renderer_rows.push(
+                        row(
+                            format!("{} more under 1 µs", folded.len()),
+                            per_frame(folded_ms),
+                        )
+                        .nested_2(),
+                    );
+                }
             }
-            // What render() spends that no pass accounts for: per-frame
-            // uploads, culling, bookkeeping.
-            let in_passes: f64 = passes.iter().map(|pass| pass.ms).sum();
-            renderer_rows.push(
-                row(
-                    "outside the passes",
-                    per_frame((phase.ms - in_passes).max(0.0)),
-                )
-                .nested(),
-            );
+            // The glue between the scopes.
+            if let Some(in_scopes) = in_scopes {
+                renderer_rows.push(
+                    row(
+                        "outside the scopes",
+                        per_frame((phase.ms - in_scopes).max(0.0)),
+                    )
+                    .nested(),
+                );
+            }
         }
         panel.set(
             Group::Renderer,
@@ -479,10 +550,61 @@ impl Stats {
             ema[0].map_or("—".to_string(), per_frame),
             page_rows,
         );
+
+        self.show_budget(msg, refresh.period_ms(), ema[0]);
+    }
+
+    /// The `frame budget` group: one lane per thread plus the GPU, each its
+    /// time per drawn frame, against the refresh period. CPU and GPU work
+    /// run in parallel, so each must fit the budget on its own; they do not
+    /// add up, except when the CPU waits on the GPU, which shows as missed
+    /// frames.
+    fn show_budget(&self, msg: &StatsMsg, period_ms: Option<f64>, page_ms: Option<f64>) {
+        let Some(budget) = period_ms else {
+            self.panel.set(Group::Budget, "measuring…", Vec::new());
+            return;
+        };
+        let gpu = msg.gpu_ms.map(f64::from);
+        // Renderer and physics share the game worker: one lane, its whole
+        // frame.
+        let lanes: Vec<(&str, f64)> = [
+            ("GPU", gpu),
+            (
+                "game worker (renderer + physics)",
+                Some(f64::from(msg.worker_ms)),
+            ),
+            (Group::Page.label(), page_ms),
+        ]
+        .into_iter()
+        .filter_map(|(label, ms)| Some((label, ms?)))
+        .collect();
+
+        let mut headline = format!("{budget:.1} ms ({:.0} Hz)", 1000.0 / budget);
+        let mut over = false;
+        if let Some(largest) = lanes.iter().map(|(_, ms)| *ms).reduce(f64::max) {
+            let headroom = budget - largest;
+            over = headroom < 0.0;
+            if over {
+                headline += &format!(" · over by {} ms", ms_1dp(-headroom));
+            } else {
+                headline += &format!(" · headroom {} ms", ms_1dp(headroom));
+            }
+        }
+        let mut rows: Vec<Row> = lanes
+            .iter()
+            .map(|&(label, ms)| row(label, budget_share(ms, budget)))
+            .collect();
+        if let Some(gpu) = gpu {
+            rows.push(row(
+                "latency (renderer + GPU), reference only",
+                format!("{} ms", ms_1dp(f64::from(msg.renderer_ms) + gpu)),
+            ));
+        }
+        self.panel.set_bad(Group::Budget, headline, rows, over);
     }
 }
 
-/// Passes, slowest first.
+/// Rows, slowest first.
 fn slowest_first(entries: &[TimingMean]) -> Vec<&TimingMean> {
     let mut sorted: Vec<&TimingMean> = entries.iter().collect();
     sorted.sort_by(|a, b| b.ms.total_cmp(&a.ms));

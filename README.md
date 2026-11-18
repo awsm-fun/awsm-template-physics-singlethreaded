@@ -234,6 +234,15 @@ The top-right **Stats** panel (bottom-left **Stats** button;
 every number sits under the thread that spent it, with its unit and its basis
 (`/ frame`, `/ step`, `/ s`):
 
+- **frame budget**: the refresh period (`16.7 ms (60 Hz) · headroom 9.5 ms`,
+  headroom being the budget less the largest lane; `over by …` and red when
+  that is negative) and, expanded, one lane per thread plus the GPU, each its
+  time per drawn frame against the budget: GPU, the game worker (renderer +
+  physics, one thread so one lane: its whole frame) and page. CPU and GPU
+  work run in parallel, so each must fit the budget on its own; they do not
+  add up, except when the CPU waits on the GPU, which shows as missed frames.
+  The last row, renderer CPU plus GPU per frame, is a latency figure for
+  reference only.
 - **display**: the refresh rate of the browser's frame clock, measured by a
   `requestAnimationFrame` loop on the (light) main thread since no web API
   reports it (`packages/frontend/src/refresh.rs`); frames presented per
@@ -249,10 +258,15 @@ every number sits under the thread that spent it, with its unit and its basis
   in the worker's one loop, so its frame is split, never double counted:
   physics is the time inside the fixed-step loop (per step), the renderer
   everything else the frame does (per frame). Expanded, the renderer shows
-  its phases (read app state + interpolate, set camera, update transforms,
-  render with awsm-renderer's per-pass CPU time nested under it, post sound
-  cues, timing the passes); physics shows steps/s, the step's phases (apply input, Box3D step,
-  contacts + sound cues, update poses) and the balls dropped.
+  its phases in the order they run (read app state + interpolate, post sound
+  cues, set camera, update transforms, render), with awsm-renderer's CPU
+  scopes nested under render, grouped by `profiling::cpu_scope_kind` into
+  **prepare** (uploads, bind groups, … before the first pass), **passes**,
+  **submit** and **hooks** (when any ran), each listing its scopes slowest
+  first (those under 1 µs folded into one line), then **outside the
+  scopes**: the rest of render. Physics shows steps/s, the step's phases
+  (apply input, Box3D step, contacts + sound cues, update poses) and the
+  balls dropped.
 - **page (main thread)**: this thread's own per-frame work (its camera frame
   loop and the sound cues it plays).
 
@@ -260,11 +274,8 @@ Groups start collapsed and remember their state (`awsm_box3d_st_stats_open_<id>`
 `?reset` clears it). The worker samples its own counters and posts a smoothed
 `StatsMsg` ~1 Hz. Expanding a group is what turns on its breakdown: main
 posts a `StatsDetailMsg`, and only then does the worker time its phases,
-sample awsm-renderer's per-pass CPU timing, or pass on the per-pass GPU
-times. The renderer's per-pass CPU timers are expensive in a worker, so they
-run on one frame in sixteen (`SubFrame`; `Off` otherwise and whenever
-collapsed), and what they add to the average frame is listed as "timing the
-passes".
+turn on awsm-renderer's CPU scopes (`SubFrame` on every frame while open,
+`Off` whenever collapsed), or pass on the per-pass GPU times.
 
 ## The build (why it's plain)
 

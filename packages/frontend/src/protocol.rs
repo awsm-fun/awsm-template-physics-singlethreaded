@@ -425,6 +425,9 @@ pub struct StatsMsg {
     pub renderer_ms: f32,
     /// Avg physics CPU ms per fixed step.
     pub step_ms: f32,
+    /// Avg CPU ms of the worker's whole frame: the renderer's time plus its
+    /// physics steps', per frame drawn.
+    pub worker_ms: f32,
     /// Fixed steps per second (locked to `SIM_HZ` when healthy).
     pub sps: f32,
     /// Balls dropped so far.
@@ -439,11 +442,15 @@ pub struct StatsMsg {
     /// left out together with their frame.
     pub span_ms: f64,
     /// The breakdowns main asked for (see [`StatsDetailMsg`]); empty
-    /// otherwise. The renderer's phases in their fixed order, ms per frame,
-    /// then what timing its passes adds to the average frame.
+    /// otherwise. The renderer's phases in the order they run, ms per frame.
     pub renderer_phases: Vec<TimingMean>,
-    /// awsm-renderer's CPU time per pass, ms per frame it was timed on.
+    /// awsm-renderer's CPU scopes inside `render()`, ms per frame, by
+    /// `profiling::cpu_scope_kind`: before the first pass, one per pass, the
+    /// submit, and the render hooks.
+    pub renderer_prep: Vec<TimingMean>,
     pub renderer_passes: Vec<TimingMean>,
+    pub renderer_submit: Vec<TimingMean>,
+    pub renderer_hooks: Vec<TimingMean>,
     /// The GPU's time per pass, ms per frame.
     pub gpu_passes: Vec<TimingMean>,
     /// The phases of one physics step in order, ms per step.
