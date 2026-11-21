@@ -320,6 +320,11 @@ fn stats_tab() -> Vec<Dom> {
                 "Sends this frame's sound cues to the page.",
             ),
             (
+                "animations + particles",
+                "Advances the scene's authored clips, texture flows and particle emitters \
+                 by the frame's time.",
+            ),
+            (
                 "set camera, update transforms",
                 "Sets the view, and turns the new poses into world matrices.",
             ),

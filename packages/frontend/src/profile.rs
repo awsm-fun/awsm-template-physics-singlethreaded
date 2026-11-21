@@ -33,20 +33,24 @@ use crate::protocol::{TimingMean, DETAIL_GPU, DETAIL_PHYSICS, DETAIL_RENDERER};
 #[derive(Clone, Copy)]
 pub enum Phase {
     /// Everything before the transforms are resolved, minus the physics
-    /// steps and the cues: the camera pose main posted, click-drops,
+    /// steps, the cues and `Animate`: the camera pose main posted, click-drops,
     /// interpolating every body and writing its transform.
     ReadApp,
     /// Posting the steps' audio cues to main.
     SoundCues,
+    /// The scene's clips + texture UV flows (`update_animations`) and its
+    /// particles (`ParticleDriver::tick`), before the bodies are written.
+    Animate,
     SetCamera,
     UpdateTransforms,
     /// `AwsmRenderer::render`: encoding every pass and submitting.
     Render,
 }
 
-const PHASE_NAMES: [&str; 5] = [
+const PHASE_NAMES: [&str; 6] = [
     "read app state + interpolate",
     "post sound cues",
+    "animations + particles",
     "set camera",
     "update transforms",
     "render (encode + submit)",
@@ -123,7 +127,7 @@ pub struct Profile {
     detail: u32,
     /// This window's sums while the renderer group is open: the phases (ms)
     /// and the frames drawn.
-    phase_ms: [f64; 5],
+    phase_ms: [f64; 6],
     frames: u32,
     steps: StepTimer,
     /// The renderer's per-scope `(total ms, runs)` at the window's start, or
@@ -147,7 +151,7 @@ impl Profile {
             },
             perf,
             detail: 0,
-            phase_ms: [0.0; 5],
+            phase_ms: [0.0; 6],
             frames: 0,
             cpu_seen: HashMap::new(),
             gpu_base: None,
@@ -215,7 +219,7 @@ impl Profile {
     }
 
     fn reset_window(&mut self) {
-        self.phase_ms = [0.0; 5];
+        self.phase_ms = [0.0; 6];
         self.frames = 0;
         self.steps.ms = [0.0; 4];
         self.steps.steps = 0;

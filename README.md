@@ -87,7 +87,7 @@ by `postMessage` (see [Data flow](#data-flow)).
 |---|---|---|---|
 | **App shell** | `packages/frontend/src/main_thread.rs` | main | Owns the DOM (built with **Dominator**) + keyboard/pointer input, the settings/stats UI, and the **WebAudio player** (`packages/frontend/src/audio.rs`). Sizes the canvas, `transferControlToOffscreen`, and spawns the worker. Forwards input as messages; plays back the worker's audio cues. |
 | **Worker spawn** | `packages/frontend/src/bootstrap.rs` | main | Builds the inline-blob worker and posts it the compiled `WebAssembly.Module` (**not** memory) + the `OffscreenCanvas`. Shared-nothing, so no COOP/COEP. |
-| **Game loop** | `packages/frontend/src/game.rs` | worker | Builds **awsm-renderer** on the `OffscreenCanvas`, loads `scene.toml` via `load_scene_for_player`, derives the collider list (`derive_physics`), and every frame: steps physics, **interpolates** each body's pose into the transform arena, updates the orbit camera, renders, and posts audio cues + sampled stats to main. Applies the input/camera/drop/resize/quality messages it receives. |
+| **Game loop** | `packages/frontend/src/game.rs` | worker | Builds **awsm-renderer** on the `OffscreenCanvas`, loads `scene.toml` via `load_scene_for_player`, derives the collider list (`derive_physics`), and every frame: steps physics, advances the scene's clips, texture flows and particles, **interpolates** each body's pose into the transform arena (after the clips, so physics wins on the bodies it drives), updates the orbit camera, renders, and posts audio cues + sampled stats to main. Applies the input/camera/drop/resize/quality messages it receives. |
 | **Physics** | `packages/frontend/src/physics.rs` | worker | A **Box3D** `World` built from the scene's colliders (static table + walls, dynamic ball), stepped at a **fixed step** (`SIM_HZ`, 240 Hz default) with wall-clock catch-up. Reads input, keeps a prev/curr pose per body, and emits audio cues from contact/hit events. Box3D runs `workerCount = 1` (its inline serial path). |
 | **Audio** | `packages/frontend/src/audio.rs` | main | Plays the `awsm-audio` export and drives it live from the physics cues (roll / wall-hit / land / ball-clack) the worker posts back. |
 | **Protocol** | `packages/frontend/src/protocol.rs` | both | The message enums (serde) both threads speak, plus the shared constants (`SIM_HZ`, `CAMERA_ORBIT_SENSITIVITY`, the `HELD_*` bits). |
@@ -109,7 +109,8 @@ pose at most once per main frame while it moves), never per-frame render data:
   WebAudio player ◀── AudioMsg ◀──┐
   loading / status ◀── RenderMsg ◀┤          game loop, each rAF frame:
   stats panel     ◀── StatsMsg ◀──┘            drain drops → step World × N (fixed dt)
-                                               → interpolate poses → write arena → render
+                                               → clips + particles → interpolate poses
+                                               → write arena → render
 ```
 
 **The camera is owned by main.** Right-drag and the wheel change main's
@@ -259,12 +260,12 @@ every number sits under the thread that spent it, with its unit and its basis
   physics is the time inside the fixed-step loop (per step), the renderer
   everything else the frame does (per frame). Expanded, the renderer shows
   its phases in the order they run (read app state + interpolate, post sound
-  cues, set camera, update transforms, render), with awsm-renderer's CPU
-  scopes nested under render, grouped by `profiling::cpu_scope_kind` into
-  **prepare** (uploads, bind groups, … before the first pass), **passes**,
-  **submit** and **hooks** (when any ran), each listing its scopes slowest
-  first (those under 1 µs folded into one line), then **outside the
-  scopes**: the rest of render. Physics shows steps/s, the step's phases
+  cues, animations + particles, set camera, update transforms, render), with
+  awsm-renderer's CPU scopes nested under render, grouped by
+  `profiling::cpu_scope_kind` into **prepare** (uploads, bind groups, …
+  before the first pass), **passes**, **submit** and **hooks** (when any
+  ran), each listing its scopes slowest first (those under 1 µs folded into
+  one line), then **outside the scopes**: the rest of render. Physics shows steps/s, the step's phases
   (apply input, Box3D step, contacts + sound cues, update poses) and the
   balls dropped.
 - **page (main thread)**: this thread's own per-frame work (its camera frame
@@ -381,7 +382,10 @@ gate + cooldown so shoving the ball against a rail doesn't machine-gun the knock
    what gets served: the `copy-dir` links in `packages/frontend/index.html`
    put it in `dist/` same-origin, and `task dev`'s side media server serves
    `media/` as-is. External scene assets go into the `HttpAssets` source passed
-   to `load_scene_for_player`.
+   to `load_scene_for_player`. The scene's lights, post-processing, clips,
+   texture UV flows and particle emitters all play; its authored anti-aliasing
+   does not — the player's Settings choice is written into the scene before
+   the load.
 3. Author **collider nodes** in your scene for anything physical. They're derived
    automatically (`game::derive_physics`) — the node named `Ball` is the dynamic
    body; rename/extend that convention as needed and adjust the camera framing.
@@ -395,7 +399,7 @@ git submodule at `vendor/box3d` and built by the local `packages/box3d-sys` crat
 [Box3D — C physics inside the same wasm module](#box3d--c-physics-inside-the-same-wasm-module)
 and `BOX3D.md` for the integration reference.
 
-All Rust crates are from **crates.io** — `awsm-renderer` family `0.15`,
+All Rust crates are from **crates.io** — `awsm-renderer` family `0.44`,
 `awsm-audio` family `2.5`, `dominator` / `futures-signals`, `glam` `0.32`,
 `libm` (the wasm libc shim's transcendentals) — with **one** exception:
 `dominator` is redirected via `[patch.crates-io]` to an upstream git rev. The

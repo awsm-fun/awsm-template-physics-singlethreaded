@@ -11,10 +11,14 @@
 //! 1. drain click-drops (unproject onto the tabletop, spawn a ball),
 //! 2. step the fixed-timestep [`World`] as many times as elapsed real time
 //!    bought (the accumulator),
-//! 3. **interpolate** each body's prev→curr pose by one alpha and write the
-//!    resulting matrix into the renderer's shared-arena transform slot,
-//! 4. update the orbit camera + render,
-//! 5. post the frame's audio cues (and, ~1 Hz, sampled stats) to main.
+//! 3. advance the scene's clips + texture flows (`update_animations`) and its
+//!    particles ([`ParticleDriver`](awsm_renderer_scene_loader::ParticleDriver))
+//!    by the frame's time,
+//! 4. **interpolate** each body's prev→curr pose by one alpha and write the
+//!    resulting matrix into the renderer's shared-arena transform slot (after
+//!    the clips, so physics wins on the bodies it drives),
+//! 5. update the orbit camera + render,
+//! 6. post the frame's audio cues (and, ~1 Hz, sampled stats) to main.
 //!
 //! While the Stats panel asks (`StatsDetailMsg`), [`Profile`] also times the
 //! frame's phases and the steps' phases; see `profile`.
@@ -208,8 +212,8 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
             // across releases, so a browser that cached an older transcoder
             // (wasm included: the worker carries the query over to it) would
             // otherwise pair it with the new JS. Bump with awsm-renderer.
-            format!("{base}/workers/basis-worker.js?v=0.43.0"),
-            format!("{base}/vendor/basis/basis_transcoder.js?v=0.43.0"),
+            format!("{base}/workers/basis-worker.js?v=0.44.1"),
+            format!("{base}/vendor/basis/basis_transcoder.js?v=0.44.1"),
         ));
     }
     let get_bool = |key: &str| {
@@ -337,7 +341,16 @@ async fn run(
         futures::join!(renderer.ensure_config_pipelines(), fetch_scene(&scene_url));
     let compiled =
         compiled.map_err(|e| JsValue::from_str(&format!("ensure_config_pipelines: {e}")))?;
-    let scene = scene.map_err(|e| JsValue::from_str(&format!("load scene {scene_url}: {e}")))?;
+    let mut scene =
+        scene.map_err(|e| JsValue::from_str(&format!("load scene {scene_url}: {e}")))?;
+    // The loader applies the scene's authored anti-aliasing. This app chooses
+    // AA itself (the Settings prefs the renderer was built with), so write that
+    // choice into the scene: the loader then keeps it and compiles nothing
+    // twice.
+    scene.post_process.anti_aliasing = awsm_renderer_scene::AntiAliasingConfig {
+        msaa: desired_aa.0,
+        smaa: desired_aa.1,
+    };
     tracing::info!(
         "game worker: loaded scene {scene_url} ({} nodes)",
         scene.nodes.len()
@@ -399,6 +412,9 @@ async fn run(
     )
     .await
     .map_err(|e| JsValue::from_str(&format!("load_scene_for_player: {e}")))?;
+    // The loader builds the scene's particle emitters; the host ticks them
+    // each frame (as it advances the clips), in the render loop below.
+    let mut particles = awsm_renderer_scene_loader::ParticleDriver::new(&loaded);
 
     // Relay GPU-commit progress, deduped (the callback fires per resolution).
     // Normally a cheap no-op — the loader already ran the real commit.
@@ -643,7 +659,16 @@ async fn run(
         }
         lap_ms = profile.lap(Phase::SoundCues, lap_ms);
 
-        // 4. ── Interpolate poses → write transforms ─────────────────────────
+        // 4. ── Scene clips, texture flows, particles ────────────────────────
+        // Advanced by the same frame time as physics. Before the body writes
+        // below, so physics has the last word on the slots it drives. (Don't
+        // animate a body or its parents, though: `update_transforms` rewrites
+        // the slots of a subtree a clip moved, over the physics pose.)
+        let _ = r.update_animations(frame_ms);
+        particles.tick(r, (frame_ms / 1000.0) as f32);
+        lap_ms = profile.lap(Phase::Animate, lap_ms);
+
+        // 5. ── Interpolate poses → write transforms ─────────────────────────
         // After the catch-up loop `accumulator` is the leftover fraction of a
         // step; alpha blends prev→curr (classic fixed-timestep interpolation).
         let alpha = (accumulator / FIXED_DT_MS) as f32;
@@ -700,7 +725,7 @@ async fn run(
         }
         lap_ms = profile.lap(Phase::ReadApp, lap_ms);
 
-        // 5. ── Camera + render ──────────────────────────────────────────────
+        // 6. ── Camera + render ──────────────────────────────────────────────
         let cam = camera.borrow();
         // ONE camera API: a view matrix plus projection params. The renderer
         // supplies the depth convention (reverse-Z by default) and the live
@@ -723,7 +748,7 @@ async fn run(
         profile.lap(Phase::Render, lap_ms);
         profile.end_frame();
 
-        // 6. ── Stats + ready signal ─────────────────────────────────────────
+        // 7. ── Stats + ready signal ─────────────────────────────────────────
         let now = perf.now();
         stats.record(
             now,
