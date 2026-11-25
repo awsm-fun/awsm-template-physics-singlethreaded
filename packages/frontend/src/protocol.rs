@@ -18,12 +18,18 @@
 //!
 //! ```text
 //!   main ──(OffscreenCanvas transferred, at spawn)──▶ worker
-//!   main ──(InputMsg / CameraMsg / DropMsg / ResizeMsg / QualityMsg)──▶ worker
-//!   worker ──(RenderMsg: progress / ready / gpu-info / error)──▶ main
+//!   main ──(InputMsg / CameraMsg / DropMsg)──▶ worker
+//!   worker ──(RenderMsg: progress / ready / error)──▶ main
 //!   worker ──(AudioMsg: roll / wall-hit / land / clack)──▶ main ──▶ WebAudio
-//!   worker ──(StatsMsg, ~1 Hz)──▶ main ──▶ stats panel
-//!   main ──(StatsDetailMsg, on a panel toggle)──▶ worker
+//!   main ──(kit: resize / anti-alias, on a Settings change)──▶ worker
+//!   worker ──(kit: aa-compile-*)──▶ main ──▶ "compiling pipelines" overlay
+//!   worker ──(kit: stats, ~1 Hz)──▶ main ──▶ stats panel
+//!   main ──(kit: stats-view on a panel toggle, stats-page ~1 Hz)──▶ worker
 //! ```
+//!
+//! The "kit" messages are awsm-renderer-kit's (`awsm-renderer-settings`,
+//! `awsm-renderer-stats`): its own `{type: …}` objects, which each side hands
+//! to the kit before its own enums.
 //!
 //! Every crossing is a `postMessage` on a cold path (input events, layout
 //! changes, audio cues, ~1 Hz stats) — never per-frame render data — except
@@ -335,25 +341,7 @@ pub enum DropMsg {
     Ball { ndc_x: f32, ndc_y: f32 },
 }
 
-/// Main → worker: the canvas backing size changed (main's `ResizeObserver` — only
-/// main sees layout). The worker owns the transferred `OffscreenCanvas`, so it
-/// applies the new **device-pixel** size there.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "resize", rename_all = "kebab-case")]
-pub enum ResizeMsg {
-    Canvas { width: u32, height: u32 },
-}
-
-/// Main → worker: a runtime anti-aliasing change (a Settings toggle). The worker
-/// recompiles the affected renderer pipelines (`set_anti_aliasing`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "quality", rename_all = "kebab-case")]
-pub enum QualityMsg {
-    AntiAlias { msaa: bool, smaa: bool },
-}
-
-/// Worker → main: load progress + lifecycle + the GPU facts main needs to seed
-/// the resolution scale and cap the backing store.
+/// Worker → main: load progress + lifecycle.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "msg", rename_all = "kebab-case")]
 pub enum RenderMsg {
@@ -361,98 +349,6 @@ pub enum RenderMsg {
     Progress { message: String },
     /// The first few frames have presented — the scene is on screen.
     Ready,
-    /// GPU capability facts, posted once at startup, before the scene load.
-    GpuInfo {
-        is_fallback: bool,
-        max_texture_dim: u32,
-    },
-    /// The worker began recompiling the AA-dependent pipelines for a Settings
-    /// anti-aliasing change. Main shows the blocking "compiling pipelines"
-    /// modal until [`RenderMsg::AaCompileDone`]. Only the *first* switch in
-    /// each direction actually compiles — the renderer caches variants — so
-    /// later toggles flash the modal for a frame at most.
-    AaCompileStart { msaa: bool, smaa: bool },
-    /// A progress line for the in-flight AA recompile (mirrors the gpu-commit
-    /// callback), shown inside the modal.
-    AaCompileProgress { message: String },
-    /// The AA recompile finished — success or failure (failure also posts
-    /// [`RenderMsg::Error`]); main hides the modal either way.
-    AaCompileDone,
     /// Something failed in the worker.
     Error { message: String },
-}
-
-/// The Stats panel's breakdowns that cost something to measure, as bits in a
-/// [`StatsDetailMsg`]: main sets a group's bit while that group is expanded
-/// (and the panel open), and the worker measures the breakdown only then.
-pub const DETAIL_GPU: u32 = 1 << 0;
-pub const DETAIL_RENDERER: u32 = 1 << 1;
-pub const DETAIL_PHYSICS: u32 = 1 << 2;
-
-/// Main → worker: which Stats breakdowns to measure (`DETAIL_*` bits). Posted
-/// when a group is toggled or the panel shown/hidden, and again on `Ready`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "stats-detail", rename_all = "kebab-case")]
-pub enum StatsDetailMsg {
-    Set { bits: u32 },
-}
-
-/// One row of a breakdown: a mean in ms per frame (or per step, for the
-/// physics phases), smoothed like the headline numbers.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TimingMean {
-    pub name: String,
-    pub ms: f64,
-}
-
-/// Worker → main: sampled engine stats (~1 Hz) for the top-right panel. The
-/// worker owns the per-frame data, so it computes the smoothed rates and posts
-/// finished numbers; main only formats them.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "stats", rename_all = "kebab-case")]
-pub struct StatsMsg {
-    /// Presented frames per second (vsync-capped).
-    pub fps: f32,
-    /// Avg whole-frame GPU ms (renderer timestamp queries) — what decides
-    /// whether a frame makes vsync. `None` until a sample lands; stays `None`
-    /// on a device without `timestamp-query`.
-    pub gpu_ms: Option<f32>,
-    /// True once enough windows have passed with no GPU sample that the
-    /// device evidently can't time the GPU (the panel then says `n/a`).
-    pub gpu_unavailable: bool,
-    /// Avg renderer CPU ms per frame: the worker's frame minus its physics
-    /// steps, so it and `step_ms × steps` never count the same time twice.
-    pub renderer_ms: f32,
-    /// Avg physics CPU ms per fixed step.
-    pub step_ms: f32,
-    /// Avg CPU ms of the worker's whole frame: the renderer's time plus its
-    /// physics steps', per frame drawn.
-    pub worker_ms: f32,
-    /// Fixed steps per second (locked to `SIM_HZ` when healthy).
-    pub sps: f32,
-    /// Balls dropped so far.
-    pub balls: u32,
-    /// Frames counted in [`Self::span_ms`] this window (raw, not smoothed):
-    /// main divides the span by the display's refresh period to tell how
-    /// many refreshes went by with no new frame (see `refresh::Missed`).
-    pub span_frames: u32,
-    /// The time this window's `span_frames` covered: the sum of the intervals
-    /// between their rAF timestamps and the previous presented frame's, in ms.
-    /// Intervals longer than `refresh::MAX_INTERVAL_MS` (a hidden tab) are
-    /// left out together with their frame.
-    pub span_ms: f64,
-    /// The breakdowns main asked for (see [`StatsDetailMsg`]); empty
-    /// otherwise. The renderer's phases in the order they run, ms per frame.
-    pub renderer_phases: Vec<TimingMean>,
-    /// awsm-renderer's CPU scopes inside `render()`, ms per frame, by
-    /// `profiling::cpu_scope_kind`: before the first pass, one per pass, the
-    /// submit, and the render hooks.
-    pub renderer_prep: Vec<TimingMean>,
-    pub renderer_passes: Vec<TimingMean>,
-    pub renderer_submit: Vec<TimingMean>,
-    pub renderer_hooks: Vec<TimingMean>,
-    /// The GPU's time per pass, ms per frame.
-    pub gpu_passes: Vec<TimingMean>,
-    /// The phases of one physics step in order, ms per step.
-    pub step_phases: Vec<TimingMean>,
 }

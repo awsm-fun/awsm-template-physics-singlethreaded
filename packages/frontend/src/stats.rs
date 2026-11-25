@@ -1,712 +1,244 @@
-//! The Stats panel (top right) and the Stats button (bottom left).
+//! What the game worker tells the page's Stats panel.
 //!
-//! One group per thread, so every number sits under the thread that spent
-//! it, and every number says its unit and what it is per:
+//! awsm-renderer-stats does the measuring and the formatting: frame windows,
+//! smoothing, the frame budget, the display group (from the page's own frame
+//! gaps), the renderer's CPU scopes and GPU passes, and the page group (from
+//! the page's own work times). Its `StatsCollector` runs here, on the thread
+//! that renders, and posts a report about once a second; the page's
+//! `StatsPanel` only shows it, and sends back which groups are open.
 //!
-//! - `frame budget`: the refresh period, and each thread's and the GPU's
-//!   time per drawn frame against it.
-//! - `display`: the refresh rate of the browser's frame clock (measured here,
-//!   see `refresh`), the frames the worker presented per second, and the
-//!   refreshes that went by with no new frame.
-//! - `GPU`: the GPU's time per frame (renderer timestamp queries; `n/a`
-//!   without them). Its rows are the passes; on GPUs that run passes
-//!   overlapped (Apple's) they add up to more than the frame, which is
-//!   expected, not a bug.
-//! - `renderer (game worker)` and `physics (Box3D, game worker)`: the game
-//!   worker's CPU time, split so nothing is counted twice: physics is the
-//!   time inside the fixed-step loop (per step), the renderer everything
-//!   else the worker's frame does (per frame). Expanded, the renderer shows
-//!   its phases and awsm-renderer's CPU scopes inside `render()`.
-//! - `page (main thread)`: this thread's own per-frame work.
-//!
-//! A group's header always shows its headline. Expanding a group shows its
-//! breakdown, and only then is the breakdown measured: main posts the
-//! expanded groups' `DETAIL_*` bits ([`StatsDetailMsg`]) and the worker times
-//! its phases and passes only while a bit is set. A collapsed group costs
-//! nothing.
-//!
-//! The worker samples its own counters and posts a smoothed [`StatsMsg`]
-//! about once a second (see `game::StatsAcc`); main measures the display and
-//! its own work, and lays it all out.
-//!
-//! [`StatsDetailMsg`]: crate::protocol::StatsDetailMsg
+//! This file adds what is particular to this project: the names of the
+//! frame's phases, and the physics group. Renderer and physics share this
+//! worker, so the frame is split, never double counted: the physics steps
+//! are physics time, the renderer everything else the frame does. The
+//! frame budget has one lane for the whole worker (renderer + physics),
+//! carried by the physics group.
 
-use std::cell::{Cell, RefCell};
-use std::rc::Rc;
+use awsm_renderer_stats::{
+    duration_row, step_headline, AppSection, NamedMeans, SectionSpec, StatRow, StatsCollector,
+    StatsConfig, Window, WARMUP_FRAMES,
+};
 
-use dominator::{clone, html, Dom};
-use futures_signals::signal::{Mutable, Signal, SignalExt};
-use futures_signals::signal_vec::{MutableVec, SignalVecExt};
-
-use crate::main_thread::{coarse_pointer, store_bool, stored_bool, STATS_STORAGE_KEY};
-use crate::protocol::{StatsMsg, TimingMean, DETAIL_GPU, DETAIL_PHYSICS, DETAIL_RENDERER};
-use crate::refresh::{Missed, Refresh};
-
-mod value;
-
-use value::{bar_state, bar_width, pieces, Piece};
-
-/// Smoothing weight of each new sample of this thread's own work (the
-/// worker smooths its figures the same way).
-const EMA_ALPHA: f64 = 0.35;
-/// The renderer phase whose time its scope rows break down.
-const RENDER_PHASE: &str = "render (encode + submit)";
-/// Scopes under this mean (ms per frame) are folded into one line.
-const FOLD_BELOW_MS: f64 = 0.001;
-
-/// A lane of the frame budget: the GPU or a thread. Its colour (index.html,
-/// `--lane-*`) is a dot on its budget row and on its group's header, so the
-/// two pair up; About's Stats tab marks its sections the same way.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Lane {
-    Gpu,
-    /// The game worker: the renderer and physics groups are both this one
-    /// thread, so both carry its colour.
-    Sim,
-    Page,
+/// The renderer's phases of one frame, in the order they run; the Stats
+/// panel lists them by these names. The physics steps run between the start
+/// of `ReadApp` and `SoundCues`, and are not a renderer phase.
+#[derive(Clone, Copy)]
+pub enum Phase {
+    /// Everything before the transforms are resolved, minus the physics
+    /// steps, the cues and `Animate`: the camera pose main posted, click-drops,
+    /// interpolating every body and writing its transform.
+    ReadApp,
+    /// Posting the steps' audio cues to main.
+    SoundCues,
+    /// The scene's clips + texture UV flows (`update_animations`) and its
+    /// particles (`ParticleDriver::tick`), before the bodies are written.
+    Animate,
+    SetCamera,
+    UpdateTransforms,
+    /// `AwsmRenderer::render`: encoding every pass and submitting.
+    Render,
 }
 
-impl Lane {
-    /// The `data-lane` attribute that picks the colour.
-    pub fn attr(self) -> &'static str {
-        match self {
-            Lane::Gpu => "gpu",
-            Lane::Sim => "sim",
-            Lane::Page => "page",
-        }
+const PHASE_NAMES: [&str; 6] = [
+    "read app state + interpolate",
+    "post sound cues",
+    "animations + particles",
+    "set camera",
+    "update transforms",
+    "render (encode + submit)",
+];
+
+/// Not a renderer phase: `StatsCollector::lap` with this index only moves
+/// the phase clock on (the physics steps are physics time).
+pub const NOT_RENDERER: usize = usize::MAX;
+
+/// The physics group's id (the page stores whether it is open under it).
+pub const PHYSICS: &str = "physics";
+const PHYSICS_LABEL: &str = "physics (Box3D, game worker)";
+/// The frame budget's one lane for this worker.
+const WORKER_LANE_LABEL: &str = "game worker (renderer + physics)";
+
+/// The Stats panel's configuration: the frame's renderer phases, and the
+/// physics group (the game worker's lane, green) between the renderer and
+/// the page. The renderer is not a lane of the budget on its own: the
+/// worker's lane is renderer + physics.
+pub fn config() -> StatsConfig {
+    StatsConfig {
+        renderer_label: "renderer (game worker)".to_string(),
+        phases: PHASE_NAMES.map(String::from).to_vec(),
+        render_phase: Some(Phase::Render as usize),
+        sections: vec![SectionSpec::new(PHYSICS, PHYSICS_LABEL, Some("sim"))],
+        renderer_in_budget: false,
+        // The worker draws on every refresh: no pacing row.
+        pacing_row: false,
+        ..StatsConfig::default()
     }
 }
 
-/// The groups, top to bottom.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Group {
-    Budget,
-    Display,
-    Gpu,
-    Renderer,
-    Physics,
-    Page,
+/// The phases of one physics step (`World::step`), in order.
+#[derive(Clone, Copy)]
+pub enum StepPhase {
+    Input,
+    Box3dStep,
+    Contacts,
+    Poses,
 }
 
-impl Group {
-    const ALL: [Group; 6] = [
-        Group::Budget,
-        Group::Display,
-        Group::Gpu,
-        Group::Renderer,
-        Group::Physics,
-        Group::Page,
-    ];
+const STEP_PHASE_NAMES: [&str; 4] = [
+    "apply input",
+    "Box3D step",
+    "contacts + sound cues",
+    "update poses",
+];
 
-    /// Storage / element id.
-    fn id(self) -> &'static str {
-        match self {
-            Group::Budget => "budget",
-            Group::Display => "display",
-            Group::Gpu => "gpu",
-            Group::Renderer => "renderer",
-            Group::Physics => "physics",
-            Group::Page => "page",
-        }
+/// Times the phases of physics steps. Handed to `World::step` only while the
+/// physics group is open, so a collapsed group costs a step one `None` check.
+pub struct StepTimer {
+    perf: web_sys::Performance,
+    last_ms: f64,
+    ms: [f64; 4],
+    steps: u32,
+}
+
+impl StepTimer {
+    /// Starts a step.
+    pub fn begin(&mut self) {
+        self.last_ms = self.perf.now();
+        self.steps += 1;
     }
 
-    fn label(self) -> &'static str {
-        match self {
-            Group::Budget => "frame budget",
-            Group::Display => "display",
-            Group::Gpu => "GPU",
-            Group::Renderer => "renderer (game worker)",
-            Group::Physics => "physics (Box3D, game worker)",
-            Group::Page => "page (main thread)",
-        }
+    /// Charges the time since the last lap to `phase`.
+    pub fn lap(&mut self, phase: StepPhase) {
+        let now = self.perf.now();
+        self.ms[phase as usize] += now - self.last_ms;
+        self.last_ms = now;
     }
 
-    /// The bit that asks the worker to measure this group's breakdown.
-    fn detail(self) -> u32 {
-        match self {
-            Group::Gpu => DETAIL_GPU,
-            Group::Renderer => DETAIL_RENDERER,
-            Group::Physics => DETAIL_PHYSICS,
-            Group::Budget | Group::Display | Group::Page => 0,
-        }
-    }
-
-    fn lane(self) -> Option<Lane> {
-        match self {
-            Group::Gpu => Some(Lane::Gpu),
-            Group::Renderer | Group::Physics => Some(Lane::Sim),
-            Group::Page => Some(Lane::Page),
-            Group::Budget | Group::Display => None,
-        }
+    fn take(&mut self) -> ([f64; 4], u32) {
+        let out = (self.ms, self.steps);
+        self.ms = [0.0; 4];
+        self.steps = 0;
+        out
     }
 }
 
-/// The `localStorage` key of a group's open/closed state.
-fn open_key(group: Group) -> String {
-    format!("{STATS_STORAGE_KEY}_open_{}", group.id())
+/// The physics group's sums since the last report.
+pub struct PhysicsStats {
+    timer: StepTimer,
+    /// Frames since `ready` (the collector's warm-up ends at
+    /// [`WARMUP_FRAMES`]; the sums start over there).
+    frames_since_ready: Option<u32>,
+    frames: u32,
+    steps: u32,
+    step_ms: f64,
+    worker_ms: f64,
+    phases: NamedMeans,
 }
 
-/// Every group's open/closed key, for `?reset`.
-pub fn open_keys() -> impl Iterator<Item = String> {
-    Group::ALL.into_iter().map(open_key)
-}
-
-/// A duration with its unit: microseconds below a tenth of a millisecond.
-fn duration(ms: f64) -> String {
-    if ms < 0.09995 {
-        let us = ms * 1000.0;
-        if us < 9.95 {
-            format!("{us:.1} µs")
-        } else {
-            format!("{us:.0} µs")
-        }
-    } else if ms < 9.995 {
-        format!("{ms:.2} ms")
-    } else {
-        format!("{ms:.1} ms")
-    }
-}
-
-fn per_frame(ms: f64) -> String {
-    format!("{} / frame", duration(ms))
-}
-
-fn per_step(ms: f64) -> String {
-    format!("{} / step", duration(ms))
-}
-
-/// Milliseconds with one decimal, for the frame budget: `<0.1` for a
-/// nonzero time that would print as 0.0.
-fn ms_1dp(ms: f64) -> String {
-    if ms > 0.0 && ms < 0.05 {
-        "<0.1".to_string()
-    } else {
-        format!("{ms:.1}")
-    }
-}
-
-/// A frame budget row: `7.2 / 16.7 ms (43%)`.
-fn budget_share(used_ms: f64, budget_ms: f64) -> String {
-    let pct = used_ms / budget_ms * 100.0;
-    let pct = if pct > 0.0 && pct < 1.0 {
-        "<1%".to_string()
-    } else {
-        format!("{pct:.0}%")
-    };
-    format!("{} / {budget_ms:.1} ms ({pct})", ms_1dp(used_ms))
-}
-
-fn smooth(ema: Option<f64>, value: f64) -> f64 {
-    match ema {
-        Some(e) => e + (value - e) * EMA_ALPHA,
-        None => value,
-    }
-}
-
-/// One row of a group: label left, value right. `depth` indents it under
-/// the row above (a breakdown of it), up to two levels; `budget` makes it a
-/// lane of the frame budget, with its share of it.
-#[derive(Clone, PartialEq)]
-struct Row {
-    label: String,
-    value: String,
-    depth: u8,
-    budget: Option<(Lane, f64)>,
-}
-
-fn row(label: impl Into<String>, value: impl Into<String>) -> Row {
-    Row {
-        label: label.into(),
-        value: value.into(),
-        depth: 0,
-        budget: None,
-    }
-}
-
-impl Row {
-    fn nested(mut self) -> Self {
-        self.depth = 1;
-        self
-    }
-
-    fn nested_2(mut self) -> Self {
-        self.depth = 2;
-        self
-    }
-
-    fn budget(mut self, lane: Lane, share: f64) -> Self {
-        self.budget = Some((lane, share));
-        self
-    }
-}
-
-/// A lane's dot.
-fn dot(lane: Lane) -> Dom {
-    html!("span", {
-        .class("stats-dot")
-        .attr("data-lane", lane.attr())
-    })
-}
-
-/// A budget lane's share as a bar; its colour says how close to the budget.
-fn bar(share: f64) -> Dom {
-    html!("span", {
-        .class("stats-bar")
-        .apply(|dom| match bar_state(share) {
-            Some(state) => dom.class(state),
-            None => dom,
-        })
-        .child(html!("span", { .style("width", bar_width(share)) }))
-    })
-}
-
-/// A value as it is shown: the numbers bright, the units and words around
-/// them smaller and dimmer; a budget lane's after the bar for its `share`.
-fn value(text: &str, share: Option<f64>) -> Dom {
-    html!("span", {
-        .class("stats-value")
-        .apply(|dom| match share {
-            Some(share) => dom.child(bar(share)),
-            None => dom,
-        })
-        .children(pieces(text).into_iter().map(|piece| match piece {
-            Piece::Num(text) => html!("span", { .class("stats-num").text(text) }),
-            Piece::Unit(text) => html!("span", { .class("stats-unit").text(text) }),
-        }))
-    })
-}
-
-struct GroupView {
-    group: Group,
-    open: Mutable<bool>,
-    headline: Mutable<String>,
-    /// Turns the header red (over the frame budget).
-    bad: Mutable<bool>,
-    rows: MutableVec<Row>,
-}
-
-/// The panel's state: whether it is shown, and per group whether it is
-/// expanded and what it shows.
-pub struct Panel {
-    visible: Mutable<bool>,
-    groups: Vec<GroupView>,
-    /// The `DETAIL_*` bits of the expanded groups, 0 while the panel is hidden.
-    detail: Mutable<u32>,
-}
-
-impl Panel {
-    /// Hidden by default: on a phone the panel covers a lot of the screen, so
-    /// a stored "open" is only honoured on a desktop. Every group starts
-    /// collapsed unless the user expanded it before.
-    pub fn new() -> Rc<Self> {
-        let window = web_sys::window();
-        let stored = |key: &str| {
-            window
-                .as_ref()
-                .and_then(|w| stored_bool(w, key))
-                .unwrap_or(false)
-        };
-        let visible = window
-            .as_ref()
-            .is_some_and(|w| !coarse_pointer(w) && stored(STATS_STORAGE_KEY));
-        let groups = Group::ALL
-            .into_iter()
-            .map(|group| GroupView {
-                group,
-                open: Mutable::new(stored(&open_key(group))),
-                headline: Mutable::new(String::new()),
-                bad: Mutable::new(false),
-                rows: MutableVec::new(),
-            })
-            .collect();
-        let panel = Rc::new(Panel {
-            visible: Mutable::new(visible),
-            groups,
-            detail: Mutable::new(0),
-        });
-        panel.update_detail();
-        panel.placeholder("starting…");
-        panel
-    }
-
-    fn view(&self, group: Group) -> &GroupView {
-        &self.groups[group as usize]
-    }
-
-    fn update_detail(&self) {
-        let bits = if self.visible.get() {
-            self.groups
-                .iter()
-                .filter(|g| g.open.get())
-                .fold(0, |bits, g| bits | g.group.detail())
-        } else {
-            0
-        };
-        self.detail.set_neq(bits);
-    }
-
-    /// The `DETAIL_*` bits the worker should measure right now.
-    pub fn detail(&self) -> u32 {
-        self.detail.get()
-    }
-
-    pub fn detail_signal(&self) -> impl Signal<Item = u32> {
-        self.detail.signal()
-    }
-
-    fn set(&self, group: Group, headline: impl Into<String>, rows: Vec<Row>) {
-        self.set_bad(group, headline, rows, false);
-    }
-
-    fn set_bad(&self, group: Group, headline: impl Into<String>, rows: Vec<Row>, bad: bool) {
-        let view = self.view(group);
-        view.headline.set_neq(headline.into());
-        view.bad.set_neq(bad);
-        let mut current = view.rows.lock_mut();
-        if current[..] != rows[..] {
-            current.replace_cloned(rows);
-        }
-    }
-
-    /// What every group says until there are numbers.
-    fn placeholder(&self, text: &str) {
-        for group in Group::ALL {
-            let headline = if group == Group::Display { "—" } else { text };
-            self.set(group, headline, Vec::new());
-        }
-    }
-
-    /// The panel: a `what do these mean?` button that calls `on_help`, then
-    /// per group a header button (label left, headline right) and the rows
-    /// it shows while expanded.
-    pub fn dom(self: &Rc<Self>, on_help: impl Fn() + 'static) -> Dom {
-        let panel = self.clone();
-        html!("div", {
-            .class("stats")
-            .visible_signal(self.visible.signal())
-            .child(html!("button", {
-                .attr("type", "button")
-                .class("stats-help")
-                .text("what do these mean?")
-                .event(move |_: dominator::events::Click| on_help())
-            }))
-            .children(self.groups.iter().enumerate().flat_map(|(index, view)| {
-                let rows_id = format!("stats-rows-{}", view.group.id());
-                [
-                    html!("button", {
-                        .attr("type", "button")
-                        .class("stats-group")
-                        .class_signal("stats-bad", view.bad.signal())
-                        .attr("aria-controls", &rows_id)
-                        .attr_signal("aria-expanded", view.open.signal().map(|open| if open { "true" } else { "false" }))
-                        .child(html!("span", {
-                            .class("stats-name")
-                            .text_signal(view.open.signal().map(|open| if open { "▾ " } else { "▸ " }))
-                            .apply(|dom| match view.group.lane() {
-                                Some(lane) => dom.child(dot(lane)),
-                                None => dom,
-                            })
-                            .text(view.group.label())
-                        }))
-                        .text(" ") // for a screen reader; the layout ignores it
-                        .child_signal(view.headline.signal_cloned().map(|headline| Some(value(&headline, None))))
-                        .event(clone!(panel => move |_: dominator::events::Click| {
-                            let view = &panel.groups[index];
-                            let open = !view.open.get();
-                            view.open.set(open);
-                            if let Some(w) = web_sys::window() {
-                                store_bool(&w, &open_key(view.group), open);
-                            }
-                            panel.update_detail();
-                        }))
-                    }),
-                    html!("div", {
-                        .class("stats-rows")
-                        .attr("id", &rows_id)
-                        .prop_signal("hidden", view.open.signal().map(|open| !open))
-                        .children_signal_vec(view.rows.signal_vec_cloned().map(|row| {
-                            html!("div", {
-                                .class("stats-row")
-                                .apply_if(row.depth == 1, |dom| dom.class("stats-nested"))
-                                .apply_if(row.depth == 2, |dom| dom.class("stats-nested-2"))
-                                .child(html!("span", {
-                                    .class("stats-name")
-                                    .apply(|dom| match row.budget {
-                                        Some((lane, _)) => dom.child(dot(lane)),
-                                        None => dom,
-                                    })
-                                    .text(&row.label)
-                                }))
-                                .child(value(&row.value, row.budget.map(|(_, share)| share)))
-                            })
-                        }))
-                    }),
-                ]
-            }).collect::<Vec<_>>())
-        })
-    }
-
-    /// The bottom-left "Stats" chip: shows/hides the panel, persisted.
-    pub fn button(self: &Rc<Self>) -> Dom {
-        let panel = self.clone();
-        html!("button", {
-            .attr("type", "button")
-            .class("stats-btn")
-            .class_signal("active", self.visible.signal())
-            .text("Stats")
-            .event(move |_: dominator::events::Click| {
-                let next = !panel.visible.get();
-                panel.visible.set_neq(next);
-                if let Some(w) = web_sys::window() {
-                    store_bool(&w, STATS_STORAGE_KEY, next);
-                }
-                panel.update_detail();
-            })
-        })
-    }
-}
-
-/// This thread's own per-frame work, summed between stats messages: its
-/// camera frame loop, and the sound cues it plays for the worker.
-#[derive(Default)]
-pub struct PageWork {
-    frame_ms: Cell<f64>,
-    cues_ms: Cell<f64>,
-    frames: Cell<u32>,
-}
-
-impl PageWork {
-    /// One animation frame of the main thread, which took `ms`.
-    pub fn frame(&self, ms: f64) {
-        self.frame_ms.set(self.frame_ms.get() + ms);
-        self.frames.set(self.frames.get() + 1);
-    }
-
-    /// Time spent handling sound cues.
-    pub fn cues(&self, ms: f64) {
-        self.cues_ms.set(self.cues_ms.get() + ms);
-    }
-
-    fn take(&self) -> (f64, f64, u32) {
-        (
-            self.frame_ms.take(),
-            self.cues_ms.take(),
-            self.frames.take(),
-        )
-    }
-}
-
-/// Turns the worker's [`StatsMsg`]s, the display measurement and this
-/// thread's own work into the panel.
-pub struct Stats {
-    panel: Rc<Panel>,
-    page: Rc<PageWork>,
-    refresh: Rc<RefCell<Refresh>>,
-    missed: RefCell<Missed>,
-    /// This thread's work per frame: total, camera loop, sound cues.
-    page_ema: Cell<[Option<f64>; 3]>,
-    received: Cell<bool>,
-}
-
-impl Stats {
-    pub fn new(panel: Rc<Panel>, page: Rc<PageWork>, refresh: Rc<RefCell<Refresh>>) -> Self {
+impl PhysicsStats {
+    pub fn new(perf: web_sys::Performance) -> Self {
         Self {
-            panel,
-            page,
-            refresh,
-            missed: RefCell::new(Missed::default()),
-            page_ema: Cell::new([None; 3]),
-            received: Cell::new(false),
+            timer: StepTimer {
+                perf,
+                last_ms: 0.0,
+                ms: [0.0; 4],
+                steps: 0,
+            },
+            frames_since_ready: None,
+            frames: 0,
+            steps: 0,
+            step_ms: 0.0,
+            worker_ms: 0.0,
+            phases: NamedMeans::default(),
         }
     }
 
-    /// The worker is drawing: its first numbers follow its warm-up.
-    pub fn ready(&self) {
-        if !self.received.get() {
-            self.panel.placeholder("warming up…");
+    /// The step timer for this frame's physics steps, while the physics
+    /// group is open.
+    pub fn step_timer(&mut self, stats: &StatsCollector) -> Option<&mut StepTimer> {
+        stats.is_open(PHYSICS).then_some(&mut self.timer)
+    }
+
+    /// The scene is on screen (the collector's `mark_ready`): start over.
+    pub fn ready(&mut self) {
+        self.frames_since_ready = Some(0);
+        self.clear();
+    }
+
+    fn clear(&mut self) {
+        self.frames = 0;
+        self.steps = 0;
+        self.step_ms = 0.0;
+        self.worker_ms = 0.0;
+        self.timer.take();
+    }
+
+    /// One frame: `substeps` physics steps that took `step_ms`, out of the
+    /// worker's `worker_ms` for the whole frame. Call it after the
+    /// collector's `end_frame` for the same frame.
+    pub fn frame(&mut self, substeps: u32, step_ms: f64, worker_ms: f64) {
+        self.frames += 1;
+        self.steps += substeps;
+        self.step_ms += step_ms;
+        self.worker_ms += worker_ms;
+        // The collector's first window starts after the warm-up's last frame.
+        if let Some(n) = self.frames_since_ready.as_mut() {
+            *n += 1;
+            if *n == WARMUP_FRAMES {
+                self.frames_since_ready = None;
+                self.clear();
+            }
         }
     }
 
-    pub fn on_stats(&self, msg: &StatsMsg) {
-        self.received.set(true);
-        let panel = &self.panel;
-        let refresh = self.refresh.borrow();
-        let mut missed = self.missed.borrow_mut();
-        missed.window(msg.span_frames, msg.span_ms, refresh.period_ms());
+    /// The physics group for one window: its time per fixed step, and the
+    /// whole worker's time per frame as the budget lane. Its rows: steps per
+    /// second, the step's phases (while open), and the balls dropped.
+    pub fn section(
+        &mut self,
+        stats: &mut StatsCollector,
+        window: &Window,
+        balls: usize,
+    ) -> AppSection {
+        let steps_per_s = stats.smooth("steps", f64::from(self.steps) / window.seconds);
+        let per_step = (self.steps > 0)
+            .then(|| stats.smooth("step", self.step_ms / f64::from(self.steps)))
+            .or(stats.smoothed("step"));
+        let worker = (self.frames > 0)
+            .then(|| stats.smooth("worker", self.worker_ms / f64::from(self.frames)))
+            .or(stats.smoothed("worker"));
 
-        let hz = refresh.line();
-        panel.set(
-            Group::Display,
-            format!("{hz} · {:.0} fps", msg.fps),
-            vec![
-                row("refresh rate", hz),
-                row("frames presented", format!("{:.0} / s", msg.fps)),
-                row("missed frames", missed.line()),
-            ],
-        );
-
-        let gpu = match msg.gpu_ms {
-            Some(ms) => per_frame(f64::from(ms)),
-            None if msg.gpu_unavailable => "n/a".to_string(),
-            None => "—".to_string(),
-        };
-        // On GPUs that overlap passes (Apple's), these add up to more than the
-        // frame total above; that is expected.
-        let gpu_rows = slowest_first(&msg.gpu_passes)
-            .into_iter()
-            .map(|pass| row(&pass.name, per_frame(pass.ms)))
-            .collect();
-        panel.set(Group::Gpu, gpu, gpu_rows);
-
-        // The renderer's phases in the order they run, with awsm-renderer's
-        // scopes inside render() grouped by kind under the render phase.
-        let mut renderer_rows = Vec::new();
-        for phase in &msg.renderer_phases {
-            renderer_rows.push(row(&phase.name, per_frame(phase.ms)));
-            if phase.name != RENDER_PHASE {
-                continue;
-            }
-            let mut in_scopes = None;
-            for (label, scopes) in [
-                ("prepare", &msg.renderer_prep),
-                ("passes", &msg.renderer_passes),
-                ("submit", &msg.renderer_submit),
-                ("hooks", &msg.renderer_hooks),
-            ] {
-                if scopes.is_empty() {
-                    continue;
-                }
-                let sum: f64 = scopes.iter().map(|scope| scope.ms).sum();
-                *in_scopes.get_or_insert(0.0) += sum;
-                renderer_rows.push(row(label, per_frame(sum)).nested());
-                let (shown, folded): (Vec<_>, Vec<_>) = slowest_first(scopes)
-                    .into_iter()
-                    .partition(|scope| scope.ms >= FOLD_BELOW_MS);
-                for scope in shown {
-                    renderer_rows.push(row(&scope.name, per_frame(scope.ms)).nested_2());
-                }
-                if !folded.is_empty() {
-                    let folded_ms: f64 = folded.iter().map(|scope| scope.ms).sum();
-                    renderer_rows.push(
-                        row(
-                            format!("{} more under 1 µs", folded.len()),
-                            per_frame(folded_ms),
-                        )
-                        .nested_2(),
-                    );
-                }
-            }
-            // The glue between the scopes.
-            if let Some(in_scopes) = in_scopes {
-                renderer_rows.push(
-                    row(
-                        "outside the scopes",
-                        per_frame((phase.ms - in_scopes).max(0.0)),
-                    )
-                    .nested(),
-                );
-            }
-        }
-        panel.set(
-            Group::Renderer,
-            per_frame(f64::from(msg.renderer_ms)),
-            renderer_rows,
-        );
-
-        let mut physics_rows = vec![row("steps", format!("{:.0} steps/s", msg.sps))];
-        for phase in &msg.step_phases {
-            physics_rows.push(row(&phase.name, per_step(phase.ms)));
-        }
-        physics_rows.push(row("balls dropped", msg.balls.to_string()));
-        let step = if msg.sps > 0.0 {
-            per_step(f64::from(msg.step_ms))
+        let (phase_ms, phase_steps) = self.timer.take();
+        if stats.is_open(PHYSICS) && phase_steps > 0 {
+            let steps = f64::from(phase_steps);
+            self.phases.update(
+                STEP_PHASE_NAMES
+                    .iter()
+                    .zip(phase_ms)
+                    .map(|(name, ms)| (name.to_string(), ms / steps)),
+            );
         } else {
-            "—".to_string()
-        };
-        panel.set(Group::Physics, step, physics_rows);
-
-        // This thread's work since the previous message, per main frame.
-        let (frame_ms, cues_ms, frames) = self.page.take();
-        let mut ema = self.page_ema.get();
-        if frames > 0 {
-            let per = |ms: f64| ms / f64::from(frames);
-            for (slot, ms) in ema.iter_mut().zip([frame_ms + cues_ms, frame_ms, cues_ms]) {
-                *slot = Some(smooth(*slot, per(ms)));
-            }
-            self.page_ema.set(ema);
+            self.phases.clear();
         }
-        let page_rows = match ema {
-            [_, Some(frame), Some(cues)] => vec![
-                row("camera frame loop", per_frame(frame)),
-                row("sound cues", per_frame(cues)),
-            ],
-            _ => Vec::new(),
-        };
-        panel.set(
-            Group::Page,
-            ema[0].map_or("—".to_string(), per_frame),
-            page_rows,
+
+        let mut rows = vec![StatRow::new("steps", format!("{steps_per_s:.0} steps/s"))];
+        rows.extend(
+            self.phases
+                .entries()
+                .iter()
+                .map(|(name, ms)| duration_row(name.clone(), *ms, "step")),
         );
+        rows.push(StatRow::new("balls dropped", balls.to_string()));
+        self.frames = 0;
+        self.steps = 0;
+        self.step_ms = 0.0;
+        self.worker_ms = 0.0;
 
-        self.show_budget(msg, refresh.period_ms(), ema[0]);
+        SectionSpec::new(PHYSICS, PHYSICS_LABEL, Some("sim"))
+            .group()
+            .headline(step_headline(per_step))
+            .budget_ms(worker)
+            .budget_label(WORKER_LANE_LABEL)
+            .rows(rows)
     }
-
-    /// The `frame budget` group: one lane per thread plus the GPU, each its
-    /// time per drawn frame, against the refresh period. CPU and GPU work
-    /// run in parallel, so each must fit the budget on its own; they do not
-    /// add up, except when the CPU waits on the GPU, which shows as missed
-    /// frames.
-    fn show_budget(&self, msg: &StatsMsg, period_ms: Option<f64>, page_ms: Option<f64>) {
-        let Some(budget) = period_ms else {
-            self.panel.set(Group::Budget, "measuring…", Vec::new());
-            return;
-        };
-        let gpu = msg.gpu_ms.map(f64::from);
-        // Renderer and physics share the game worker: one lane, its whole
-        // frame.
-        let lanes: Vec<(&str, Lane, f64)> = [
-            ("GPU", Lane::Gpu, gpu),
-            (
-                "game worker (renderer + physics)",
-                Lane::Sim,
-                Some(f64::from(msg.worker_ms)),
-            ),
-            (Group::Page.label(), Lane::Page, page_ms),
-        ]
-        .into_iter()
-        .filter_map(|(label, lane, ms)| Some((label, lane, ms?)))
-        .collect();
-
-        let mut headline = format!("{budget:.1} ms ({:.0} Hz)", 1000.0 / budget);
-        let mut over = false;
-        if let Some(largest) = lanes.iter().map(|(_, _, ms)| *ms).reduce(f64::max) {
-            let headroom = budget - largest;
-            over = headroom < 0.0;
-            if over {
-                headline += &format!(" · over by {:.1} ms", -headroom);
-            } else {
-                headline += &format!(" · headroom {headroom:.1} ms");
-            }
-        }
-        let mut rows: Vec<Row> = lanes
-            .iter()
-            .map(|&(label, lane, ms)| {
-                row(label, budget_share(ms, budget)).budget(lane, ms / budget)
-            })
-            .collect();
-        if let Some(gpu) = gpu {
-            rows.push(row(
-                "latency (renderer + GPU), reference only",
-                format!("{:.1} ms", f64::from(msg.renderer_ms) + gpu),
-            ));
-        }
-        self.panel.set_bad(Group::Budget, headline, rows, over);
-    }
-}
-
-/// Rows, slowest first.
-fn slowest_first(entries: &[TimingMean]) -> Vec<&TimingMean> {
-    let mut sorted: Vec<&TimingMean> = entries.iter().collect();
-    sorted.sort_by(|a, b| b.ms.total_cmp(&a.ms));
-    sorted
 }

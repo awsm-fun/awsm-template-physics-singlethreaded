@@ -4,7 +4,7 @@
 //! Everything the game does — physics, rendering, camera, drop unprojection —
 //! runs here, so the main thread stays free for DOM, input, and audio. The two
 //! threads share nothing; input arrives as [`InputMsg`]/[`CameraMsg`]/… and
-//! audio cues + stats go back as [`AudioMsg`]/[`StatsMsg`]. Each frame:
+//! audio cues + the Stats panel's reports go back. Each frame:
 //!
 //! 0. take the camera pose main posted for its previous frame (exactly one
 //!    main frame of orbit/zoom per drawn frame — see [`CameraQueue`]),
@@ -18,10 +18,14 @@
 //!    resulting matrix into the renderer's shared-arena transform slot (after
 //!    the clips, so physics wins on the bodies it drives),
 //! 5. update the orbit camera + render,
-//! 6. post the frame's audio cues (and, ~1 Hz, sampled stats) to main.
+//! 6. post the frame's audio cues (and, ~1 Hz, the Stats panel's report) to
+//!    main.
 //!
-//! While the Stats panel asks (`StatsDetailMsg`), [`Profile`] also times the
-//! frame's phases and the steps' phases; see `profile`.
+//! The Settings and the Stats panel are awsm-renderer-kit's: main posts the
+//! kit's `anti-alias` / `resize` / `stats-view` / `stats-page` here, and this
+//! worker applies the settings and runs the stats collector (see `stats`),
+//! which times the frame's phases and the steps' phases only while their
+//! groups are open.
 //!
 //! ## Pacing (why this shape, for smoothest motion)
 //!
@@ -49,12 +53,21 @@ use wasm_bindgen::JsCast;
 use web_sys::js_sys;
 use web_sys::OffscreenCanvas;
 
+use awsm_renderer::transforms::TransformKey;
+use awsm_renderer_settings::{
+    apply_anti_aliasing, post_to_page, scene_anti_aliasing, AaMode, SettingsToPage,
+    SettingsToWorker,
+};
+use awsm_renderer_stats::{
+    post_report, stats_logging, FrameInput, RendererTimings, StatsCollector, StatsToWorker,
+};
+
 use crate::physics::{Pose, World};
-use crate::profile::{Phase, Profile};
 use crate::protocol::{
     AudioMsg, CameraMsg, CameraPose, ColliderInit, ColliderShapeMsg, DropMsg, Input, InputMsg,
-    QualityMsg, RenderMsg, ResizeMsg, StatsDetailMsg, StatsMsg, ROLE_FLOOR, SIM_HZ,
+    RenderMsg, ROLE_FLOOR, SIM_HZ,
 };
+use crate::stats::{self, Phase, PhysicsStats, NOT_RENDERER};
 
 /// Player input, held on the worker and fed by [`InputMsg`]s.
 type SharedInput = Rc<Input>;
@@ -64,10 +77,12 @@ type SharedCamera = Rc<RefCell<OrbitCamera>>;
 type SharedCameraQueue = Rc<RefCell<CameraQueue>>;
 /// Pending click-drops as NDC points, drained + unprojected by the loop.
 type DropQueue = Rc<RefCell<Vec<(f32, f32)>>>;
-/// A pending Settings anti-aliasing change `(msaa, smaa)`, applied off the render path.
-type PendingAa = Rc<Cell<Option<(bool, bool)>>>;
-/// The Stats breakdowns main asks for (`DETAIL_*` bits, see [`StatsDetailMsg`]).
-type StatsDetail = Rc<Cell<u32>>;
+/// A pending Settings anti-aliasing change, applied off the render path.
+type PendingAa = Rc<Cell<Option<AaMode>>>;
+/// The Stats panel's numbers (awsm-renderer-stats): the render loop feeds
+/// it, main's `stats-view` / `stats-page` reach it through the message
+/// handler.
+type SharedStats = Rc<RefCell<StatsCollector>>;
 /// The self-referencing rAF callback cell (so the loop can reschedule itself).
 type RafCell = Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>>;
 
@@ -84,15 +99,22 @@ const MAX_FRAME_MS: f64 = 100.0;
 /// spiral of death. Derived to cover a full [`MAX_FRAME_MS`] gap at the current
 /// rate (≈6 at 60 Hz, ≈24 at 240 Hz), so it scales with [`SIM_HZ`].
 const MAX_SUBSTEPS: u32 = (MAX_FRAME_MS / 1000.0 * SIM_HZ + 0.999) as u32;
-// ── Stats ────────────────────────────────────────────────────────────────────
-/// EMA weight for the reported fps / steps-per-second (per ~1 s window).
-const STATS_EMA_ALPHA: f64 = 0.35;
 /// Smoothing weight of each frame gap in the display-period estimate used to
 /// pick the camera pose (see [`CameraQueue`]); only needs to be roughly right.
 const PERIOD_EMA_ALPHA: f64 = 0.1;
-/// Frames that must present before stats counting starts — boot samples read
-/// 2–3× the settled cost (cold caches, pipeline warmup).
-const STATS_WARMUP_FRAMES: u32 = 60;
+/// The awsm-renderer release the vendored Basis transcoder files came with,
+/// appended to their URLs as `?v=…`: those files keep their names from one
+/// release to the next, so a browser that cached an older transcoder (wasm
+/// included: the worker carries the query over to it) would otherwise pair
+/// it with the new JS. Bump it together with awsm-renderer in Cargo.toml.
+const BASIS_VERSION: &str = "0.46.0";
+
+/// A drawn ball that moves farther than this in one frame (m) teleported
+/// (physics' fall-through respawn): under TAA its motion history is reset,
+/// so the respawned ball does not reproject the history of where it fell
+/// from. A ball never moves this far in a frame on its own (its speed is
+/// capped well below it).
+const TELEPORT_JUMP_M: f32 = 1.5;
 
 /// Lens + clip planes for the one camera this app has. Shared by the render
 /// path (`set_camera`) and the click-unprojection so the two can't drift apart
@@ -208,21 +230,19 @@ pub fn start(payload: JsValue) -> Result<(), JsValue> {
             .unwrap_or_default();
         let base = app_base.trim_end_matches('/');
         configure(BasisWorkerConfig::player(
-            // `?v=` names the vendored build: these files keep their names
-            // across releases, so a browser that cached an older transcoder
-            // (wasm included: the worker carries the query over to it) would
-            // otherwise pair it with the new JS. Bump with awsm-renderer.
-            format!("{base}/workers/basis-worker.js?v=0.45.0"),
-            format!("{base}/vendor/basis/basis_transcoder.js?v=0.45.0"),
+            format!("{base}/workers/basis-worker.js?v={BASIS_VERSION}"),
+            format!("{base}/vendor/basis/basis_transcoder.js?v={BASIS_VERSION}"),
         ));
     }
-    let get_bool = |key: &str| {
-        js_sys::Reflect::get(&payload, &JsValue::from_str(key))
-            .ok()
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-    };
-    let desired_aa = (get_bool("msaa"), get_bool("smaa"));
+    // The STARTUP anti-aliasing mode (main's Settings: the stored choice,
+    // `?aa=`, or the device default), as its id, so the renderer BUILDS with
+    // it — compiling exactly the variants this session needs.
+    let aa_id = js_sys::Reflect::get(&payload, &JsValue::from_str("aa"))
+        .ok()
+        .and_then(|v| v.as_string())
+        .unwrap_or_default();
+    let desired_aa = AaMode::from_id(&aa_id)
+        .ok_or_else(|| JsValue::from_str(&format!("game worker: unknown aa mode {aa_id:?}")))?;
 
     let gpu = match navigator_gpu() {
         Some(gpu) => gpu,
@@ -253,7 +273,7 @@ async fn run(
     gpu_builder: awsm_renderer::core::renderer::AwsmRendererWebGpuBuilder,
     canvas: OffscreenCanvas,
     origin: String,
-    desired_aa: (bool, bool),
+    desired_aa: AaMode,
 ) -> Result<(), JsValue> {
     use awsm_renderer::camera::CameraParams;
     use awsm_renderer::AwsmRendererBuilder;
@@ -279,34 +299,30 @@ async fn run(
     // a long, silent, avoidable stall on every load for e.g. every touch
     // device, whose default is MSAA off.)
     let pending_aa: PendingAa = Rc::new(Cell::new(None));
-    let stats_detail: StatsDetail = Rc::new(Cell::new(0));
+    let stats: SharedStats = Rc::new(RefCell::new(StatsCollector::new(stats::config())));
     install_message_handler(
         canvas.clone(),
         input.clone(),
         camera_queue.clone(),
         drops.clone(),
         pending_aa.clone(),
-        stats_detail.clone(),
+        stats.clone(),
     );
-
-    // Report the GPU's capabilities up front so main can seed the resolution
-    // scale (a software adapter can't push pixels) and cap the backing store.
-    report_gpu_info().await;
+    // The panel's "starting…" until the scene is on screen.
+    post_report(stats.borrow().placeholder());
 
     // The builder reports its coarse boot phases through this handler. Since the
     // deferred-boot renderer, `build()` compiles NO pipelines (it reserves them,
     // compiled by the labeled `ensure_config_pipelines` step below), so only
     // `Init` — device + core GPU resources — takes visible time here.
     let mut renderer = AwsmRendererBuilder::new(gpu_builder)
-        .with_anti_aliasing(aa_config(desired_aa))
+        .with_anti_aliasing(desired_aa.to_anti_aliasing())
         // GPU timing for the Stats panel's GPU group (the CPU tier is `Off`
-        // except while the renderer group is open, see `profile`): `Frame` tier
-        // = timestamp queries on the renderer's passes, folded into one
-        // whole-frame span (cheap; silently off without `timestamp-query`).
-        .with_logging(awsm_renderer::debug::AwsmRendererLogging {
-            gpu: awsm_renderer::debug::TimingTier::Frame,
-            ..Default::default()
-        })
+        // except while the renderer group is open: the stats collector's
+        // `begin_renderer_frame` switches it): `Frame` tier = timestamp
+        // queries on the renderer's passes, folded into one whole-frame span
+        // (cheap; silently off without `timestamp-query`).
+        .with_logging(stats_logging())
         .with_phase_handler(|phase| {
             use awsm_renderer::RendererLoadingPhase as P;
             if let P::Init = phase {
@@ -317,8 +333,8 @@ async fn run(
         .await
         .map_err(|e| JsValue::from_str(&format!("build renderer: {e}")))?;
     post_progress(&format!(
-        "WebGPU device + renderer ready (msaa {}, smaa {})",
-        desired_aa.0, desired_aa.1
+        "WebGPU device + renderer ready (anti-aliasing: {})",
+        AaMode::from_anti_aliasing(&renderer.anti_aliasing).label()
     ));
 
     // Shared-arena mode: every scene node gets a stable arena slot we can write
@@ -347,10 +363,7 @@ async fn run(
     // AA itself (the Settings prefs the renderer was built with), so write that
     // choice into the scene: the loader then keeps it and compiles nothing
     // twice.
-    scene.post_process.anti_aliasing = awsm_renderer_scene::AntiAliasingConfig {
-        msaa: desired_aa.0,
-        smaa: desired_aa.1,
-    };
+    scene.post_process.anti_aliasing = scene_anti_aliasing(&renderer.anti_aliasing);
     tracing::info!(
         "game worker: loaded scene {scene_url} ({} nodes)",
         scene.nodes.len()
@@ -522,16 +535,24 @@ async fn run(
     let mut period_ms: f64 = 1000.0 / 60.0;
     let mut frame_count: u32 = 0;
     let mut cues: Vec<AudioMsg> = Vec::new();
-    let mut ball_bindings: Vec<awsm_renderer::buffer::shared_arena::SlotBinding> = Vec::new();
-    let mut stats = StatsAcc::new(perf.now());
-    let mut profile = Profile::new(perf.clone());
+    // One arena binding per minted (dropped-ball) visual duplicate, with its
+    // transform (for a teleport's motion-history reset).
+    let mut ball_bindings: Vec<(
+        awsm_renderer::buffer::shared_arena::SlotBinding,
+        TransformKey,
+    )> = Vec::new();
+    // Where each ball was drawn last frame (the player first, then the
+    // dropped balls), to spot a teleport.
+    let mut drawn_at: Vec<Vec3> = Vec::new();
+    // The Stats panel's physics group (the collector itself is `stats`).
+    let mut physics_stats = PhysicsStats::new(perf.clone());
 
     *raf_init.borrow_mut() = Some(Closure::new(move |vsync_ms: f64| {
         // A pending Settings anti-aliasing change: apply it off the render path
         // (async recompile). Take the renderer OUT of the cell for the awaits;
         // `reconfiguring` keeps frames off it until it's put back.
         if !reconfiguring.get() {
-            if let Some((msaa, smaa)) = pending_aa.take() {
+            if let Some(mode) = pending_aa.take() {
                 reconfiguring.set(true);
                 let cell = cell.clone();
                 let done = reconfiguring.clone();
@@ -540,47 +561,27 @@ async fn run(
                         done.set(false);
                         return;
                     };
-                    // Tell main first — it raises the "compiling pipelines"
-                    // modal for the whole recompile (the first switch in each
-                    // direction really compiles; later ones hit the variant
-                    // cache and the modal only flashes).
-                    post_to_main(&RenderMsg::AaCompileStart { msaa, smaa });
-                    if let Err(e) = r.set_anti_aliasing(aa_config((msaa, smaa))).await {
-                        tracing::error!("game worker: set_anti_aliasing failed: {e:?}");
-                        post_to_main(&RenderMsg::Error {
-                            message: format!("anti-aliasing change: {e:?}"),
-                        });
-                    } else {
-                        // The actual pipeline compiles happen in commit_load —
-                        // stream its progress into the modal via the renderer's
-                        // shared phase label, deduped (the callback fires per
-                        // resolution).
-                        let mut last_line = String::new();
-                        let progress = |s: awsm_renderer::loading::LoadingStats| {
-                            let Some(line) = s.phase_label() else { return };
-                            if line != last_line {
-                                post_to_main(&RenderMsg::AaCompileProgress {
-                                    message: line.clone(),
-                                });
-                                last_line = line;
-                            }
-                        };
-                        if let Err(e) = r.commit_load(progress).await {
-                            tracing::error!(
-                                "game worker: commit_load after AA change failed: {e:?}"
-                            );
-                            post_to_main(&RenderMsg::Error {
-                                message: format!("anti-aliasing pipelines: {e:?}"),
-                            });
-                        } else {
-                            tracing::info!(
-                                "game worker: anti-aliasing applied (msaa {msaa}, smaa {smaa})"
-                            );
+                    // awsm-renderer-settings posts main the `aa-compile-*`
+                    // messages that raise and lower the "compiling pipelines"
+                    // overlay (the first switch in each direction really
+                    // compiles; later ones hit the variant cache, and
+                    // switching between TAA presets compiles nothing and shows
+                    // no overlay). `aa-compile-done` is always posted, even on
+                    // failure.
+                    let applied = apply_anti_aliasing(&mut r, mode, |event| {
+                        post_to_page(&SettingsToPage::from(event));
+                    })
+                    .await;
+                    match applied {
+                        Ok(()) => tracing::info!(
+                            "game worker: anti-aliasing applied: {}",
+                            AaMode::from_anti_aliasing(&r.anti_aliasing).label()
+                        ),
+                        Err(message) => {
+                            tracing::error!("game worker: {message}");
+                            post_to_main(&RenderMsg::Error { message });
                         }
                     }
-                    // Always lower the modal — even on failure (the error line
-                    // is already on its way to the status bar).
-                    post_to_main(&RenderMsg::AaCompileDone);
                     *cell.borrow_mut() = Some(r);
                     done.set(false);
                 });
@@ -596,8 +597,17 @@ async fn run(
             return;
         };
         let work_t0 = perf.now();
-        profile.begin_frame(r, stats_detail.get());
-        let mut lap_ms = work_t0;
+        let mut stats_ref = stats.borrow_mut();
+        let stats = &mut *stats_ref;
+        // Phase timing for the Stats panel, only while it shows the
+        // renderer's breakdown (awsm-renderer-stats).
+        stats.begin_renderer_frame(r, work_t0);
+        let timing = stats.renderer_detail();
+        let lap = |stats: &mut StatsCollector, phase: usize| {
+            if timing {
+                stats.lap(phase, perf.now());
+            }
+        };
 
         // 0. ── Camera: main's pose from its previous frame (see CameraQueue) ─
         if let Some(prev) = last_vsync {
@@ -638,9 +648,9 @@ async fn run(
         accumulator += frame_ms;
         let yaw = camera.borrow().yaw;
         let mut substeps: u32 = 0;
+        lap(stats, Phase::ReadApp as usize);
         let step_t0 = perf.now();
-        profile.charge(Phase::ReadApp, lap_ms, step_t0);
-        let mut step_timer = profile.step_timer();
+        let mut step_timer = physics_stats.step_timer(stats);
         while accumulator >= FIXED_DT_MS && substeps < MAX_SUBSTEPS {
             world.step(&input, yaw, &mut cues, step_timer.as_deref_mut());
             accumulator -= FIXED_DT_MS;
@@ -650,14 +660,14 @@ async fn run(
             accumulator = 0.0; // hit the cap — drop the backlog (avoid a spiral)
         }
         // The steps are physics time, not the renderer's: no phase gets it.
-        lap_ms = perf.now();
-        let step_ms = lap_ms - step_t0;
+        lap(stats, NOT_RENDERER);
+        let step_ms = perf.now() - step_t0;
 
         // 3. ── Audio cues → main ─────────────────────────────────────────────
         for cue in cues.drain(..) {
             post_audio(&cue);
         }
-        lap_ms = profile.lap(Phase::SoundCues, lap_ms);
+        lap(stats, Phase::SoundCues as usize);
 
         // 4. ── Scene clips, texture flows, particles ────────────────────────
         // Advanced by the same frame time as physics. Before the body writes
@@ -666,19 +676,29 @@ async fn run(
         // the slots of a subtree a clip moved, over the physics pose.)
         let _ = r.update_animations(frame_ms);
         particles.tick(r, (frame_ms / 1000.0) as f32);
-        lap_ms = profile.lap(Phase::Animate, lap_ms);
+        lap(stats, Phase::Animate as usize);
 
         // 5. ── Interpolate poses → write transforms ─────────────────────────
         // After the catch-up loop `accumulator` is the leftover fraction of a
         // step; alpha blends prev→curr (classic fixed-timestep interpolation).
         let alpha = (accumulator / FIXED_DT_MS) as f32;
+        // A teleport (see `TELEPORT_JUMP_M`): under TAA the ball's motion
+        // history goes, in the frame the jump is drawn.
+        let teleported = |drawn_at: &mut Vec<Vec3>, index: usize, pos: Vec3| {
+            if drawn_at.len() <= index {
+                drawn_at.push(pos);
+                return false;
+            }
+            let jumped = drawn_at[index].distance(pos) > TELEPORT_JUMP_M;
+            drawn_at[index] = pos;
+            jumped
+        };
         let (pp, pc) = world.player_poses();
-        write_slot(
-            binding,
-            dirty_words_addr,
-            ball_visual_scale,
-            pose_lerp(pp, pc, alpha),
-        );
+        let pose = pose_lerp(pp, pc, alpha);
+        if teleported(&mut drawn_at, 0, pose.0) {
+            r.reset_motion_history(ball_tk);
+        }
+        write_slot(binding, dirty_words_addr, ball_visual_scale, pose);
 
         // Dropped balls: mint the silver visual duplicate for any ball we haven't
         // seen yet, then interpolate every slot with the same alpha.
@@ -701,7 +721,7 @@ async fn run(
                         tracing::warn!("dropped ball material reset failed: {err}");
                     }
                     match r.transforms.arena_slot_binding(tk) {
-                        Some(b) => ball_bindings.push(b),
+                        Some(b) => ball_bindings.push((b, tk)),
                         None => {
                             tracing::error!("dropped ball has no arena slot");
                             break;
@@ -714,16 +734,15 @@ async fn run(
                 }
             }
         }
-        for (i, b) in ball_bindings.iter().enumerate() {
+        for (i, (b, tk)) in ball_bindings.iter().enumerate() {
             let (bp, bc) = world.ball_poses(i);
-            write_slot(
-                *b,
-                dirty_words_addr,
-                ball_visual_scale,
-                pose_lerp(bp, bc, alpha),
-            );
+            let pose = pose_lerp(bp, bc, alpha);
+            if teleported(&mut drawn_at, i + 1, pose.0) {
+                r.reset_motion_history(*tk);
+            }
+            write_slot(*b, dirty_words_addr, ball_visual_scale, pose);
         }
-        lap_ms = profile.lap(Phase::ReadApp, lap_ms);
+        lap(stats, Phase::ReadApp as usize);
 
         // 6. ── Camera + render ──────────────────────────────────────────────
         let cam = camera.borrow();
@@ -739,30 +758,33 @@ async fn run(
         params.focus_distance = cam.radius;
         let _ = r.set_camera(view, params);
         drop(cam);
-        lap_ms = profile.lap(Phase::SetCamera, lap_ms);
+        lap(stats, Phase::SetCamera as usize);
         r.update_transforms();
-        lap_ms = profile.lap(Phase::UpdateTransforms, lap_ms);
+        lap(stats, Phase::UpdateTransforms as usize);
         if let Err(err) = r.render(None) {
             tracing::warn!("game worker: render error: {err}");
         }
-        profile.lap(Phase::Render, lap_ms);
-        profile.end_frame();
+        lap(stats, Phase::Render as usize);
 
         // 7. ── Stats + ready signal ─────────────────────────────────────────
-        let now = perf.now();
-        stats.record(
-            now,
-            vsync_ms,
-            now - work_t0,
-            substeps,
-            step_ms,
-            ball_count as u32,
-            &mut profile,
-        );
+        // The renderer's time is the frame minus the physics steps; the
+        // physics group carries the whole worker's lane of the frame budget.
+        let worker_ms = perf.now() - work_t0;
+        let input = FrameInput::new(vsync_ms, worker_ms - step_ms);
+        let window = stats.end_frame(input, &RendererTimings);
+        physics_stats.frame(substeps, step_ms, worker_ms);
+        if let Some(window) = window {
+            let section = physics_stats.section(stats, &window, ball_count);
+            post_report(stats.report(&window, vec![section]));
+        }
         frame_count = frame_count.wrapping_add(1);
         if frame_count == 3 {
             post_to_main(&RenderMsg::Ready);
+            // The scene is on screen: the stats warm up from here.
+            post_report(stats.mark_ready());
+            physics_stats.ready();
         }
+        drop(stats_ref);
         drop(cell_ref);
         reschedule(&raf_run);
     }));
@@ -774,199 +796,63 @@ async fn run(
     Ok(())
 }
 
-/// Accumulates per-frame timings on the worker and posts a smoothed [`StatsMsg`]
-/// to main ~1 Hz (main owns the panel but not the data). Counting waits out
-/// [`STATS_WARMUP_FRAMES`] so cold-start samples don't pollute the EMAs.
-///
-/// Renderer and physics share this thread, so the frame is split, never
-/// double counted: physics is the time inside the step loop, the renderer
-/// everything else the frame does.
-struct StatsAcc {
-    window_t0: f64,
-    frames: u32,
-    steps: u32,
-    renderer_ms_sum: f64,
-    step_ms_sum: f64,
-    warmed: u32,
-    fps_ema: Option<f64>,
-    sps_ema: Option<f64>,
-    renderer_ms_ema: Option<f64>,
-    step_ms_ema: Option<f64>,
-    worker_ms_ema: Option<f64>,
-    /// The renderer's cumulative GPU frame timing `(total_ms, samples)` at the
-    /// start of the current window (`awsm_renderer::profiling::gpu_frame_timing`).
-    gpu_prev: Option<(f64, u64)>,
-    gpu_ms_ema: Option<f64>,
-    /// Consecutive windows with no GPU sample (see `StatsMsg::gpu_unavailable`).
-    gpu_empty_windows: u32,
-    balls: u32,
-    /// The previous presented frame's rAF timestamp, and this window's frame
-    /// span (see `StatsMsg::span_ms`).
-    last_vsync: Option<f64>,
-    span_frames: u32,
-    span_ms: f64,
-}
-
-/// The renderer's cumulative GPU frame timing as `(total_ms, samples)`.
-fn gpu_totals() -> Option<(f64, u64)> {
-    awsm_renderer::profiling::gpu_frame_timing().map(|s| (s.total_ms, s.count))
-}
-
-impl StatsAcc {
-    fn new(now: f64) -> Self {
-        Self {
-            window_t0: now,
-            frames: 0,
-            steps: 0,
-            renderer_ms_sum: 0.0,
-            step_ms_sum: 0.0,
-            warmed: 0,
-            fps_ema: None,
-            sps_ema: None,
-            renderer_ms_ema: None,
-            step_ms_ema: None,
-            worker_ms_ema: None,
-            gpu_prev: None,
-            gpu_ms_ema: None,
-            gpu_empty_windows: 0,
-            balls: 0,
-            last_vsync: None,
-            span_frames: 0,
-            span_ms: 0.0,
-        }
-    }
-
-    /// One frame: `frame_ms` of work on this thread, `step_ms` of it in
-    /// `substeps` physics steps.
-    #[allow(clippy::too_many_arguments)]
-    fn record(
-        &mut self,
-        now: f64,
-        vsync_ms: f64,
-        frame_ms: f64,
-        substeps: u32,
-        step_ms: f64,
-        balls: u32,
-        profile: &mut Profile,
-    ) {
-        self.balls = balls;
-        let interval = self
-            .last_vsync
-            .replace(vsync_ms)
-            .map(|prev| vsync_ms - prev);
-        // Discard boot frames entirely (don't even start the window on them).
-        if self.warmed < STATS_WARMUP_FRAMES {
-            self.warmed += 1;
-            self.window_t0 = now;
-            self.frames = 0;
-            self.steps = 0;
-            self.renderer_ms_sum = 0.0;
-            self.step_ms_sum = 0.0;
-            self.gpu_prev = gpu_totals();
-            self.span_frames = 0;
-            self.span_ms = 0.0;
-            profile.discard_window();
-            return;
-        }
-        if let Some(d) = interval.filter(|d| (0.0..crate::refresh::MAX_INTERVAL_MS).contains(d)) {
-            self.span_frames += 1;
-            self.span_ms += d;
-        }
-        self.frames += 1;
-        self.steps += substeps;
-        self.renderer_ms_sum += frame_ms - step_ms;
-        self.step_ms_sum += step_ms;
-        let dt = now - self.window_t0;
-        if dt < 1000.0 {
-            return;
-        }
-        let ema = |slot: &mut Option<f64>, v: f64| {
-            let e = slot.get_or_insert(v);
-            *e += (v - *e) * STATS_EMA_ALPHA;
-            *e
-        };
-        let secs = dt / 1000.0;
-        let fps = ema(&mut self.fps_ema, self.frames as f64 / secs);
-        let sps = ema(&mut self.sps_ema, self.steps as f64 / secs);
-        let renderer_ms = ema(
-            &mut self.renderer_ms_ema,
-            self.renderer_ms_sum / self.frames.max(1) as f64,
-        );
-        let step_ms = ema(
-            &mut self.step_ms_ema,
-            if self.steps > 0 {
-                self.step_ms_sum / self.steps as f64
-            } else {
-                0.0
-            },
-        );
-        let worker_ms = ema(
-            &mut self.worker_ms_ema,
-            (self.renderer_ms_sum + self.step_ms_sum) / self.frames.max(1) as f64,
-        );
-        // Avg GPU ms per sampled frame over the window (the timestamp readback
-        // skips frames while one is in flight — divide by samples, not frames).
-        let gpu_now = gpu_totals();
-        let gpu_window = match (gpu_now, self.gpu_prev) {
-            (Some((t1, n1)), Some((t0, n0))) if n1 > n0 => Some((t1 - t0) / (n1 - n0) as f64),
-            (Some((t1, n1)), None) if n1 > 0 => Some(t1 / n1 as f64),
-            _ => None,
-        };
-        self.gpu_prev = gpu_now;
-        let gpu_ms = match gpu_window {
-            Some(ms) => {
-                self.gpu_empty_windows = 0;
-                Some(ema(&mut self.gpu_ms_ema, ms))
-            }
-            None => {
-                self.gpu_empty_windows = self.gpu_empty_windows.saturating_add(1);
-                self.gpu_ms_ema
-            }
-        };
-        let breakdown = profile.window();
-        post_stats(&StatsMsg {
-            fps: fps as f32,
-            gpu_ms: gpu_ms.map(|v| v as f32),
-            gpu_unavailable: self.gpu_ms_ema.is_none() && self.gpu_empty_windows >= 3,
-            renderer_ms: renderer_ms as f32,
-            step_ms: step_ms as f32,
-            worker_ms: worker_ms as f32,
-            sps: sps as f32,
-            balls: self.balls,
-            span_frames: self.span_frames,
-            span_ms: self.span_ms,
-            renderer_phases: breakdown.renderer_phases,
-            renderer_prep: breakdown.renderer_prep,
-            renderer_passes: breakdown.renderer_passes,
-            renderer_submit: breakdown.renderer_submit,
-            renderer_hooks: breakdown.renderer_hooks,
-            gpu_passes: breakdown.gpu_passes,
-            step_phases: breakdown.step_phases,
-        });
-        self.span_frames = 0;
-        self.span_ms = 0.0;
-        self.window_t0 = now;
-        self.frames = 0;
-        self.steps = 0;
-        self.renderer_ms_sum = 0.0;
-        self.step_ms_sum = 0.0;
-    }
-}
-
 /// Install this worker's `onmessage`, replacing the bootstrap's init handler
-/// (which has done its job). Applies main's input/camera/drop/resize/quality
-/// messages to the shared local state the render loop reads.
+/// (which has done its job). Applies main's messages — the kit's Settings and
+/// stats ones, then input/camera/drop — to the shared local state the render
+/// loop reads.
 fn install_message_handler(
     canvas: OffscreenCanvas,
     input: SharedInput,
     camera_queue: SharedCameraQueue,
     drops: DropQueue,
     pending_aa: PendingAa,
-    stats_detail: StatsDetail,
+    stats: SharedStats,
 ) {
     let scope = js_sys::global().unchecked_into::<web_sys::DedicatedWorkerGlobalScope>();
     let cb = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |e: web_sys::MessageEvent| {
         let data = e.data();
+        // The kit's messages first: Settings' `resize` and `anti-alias`, the
+        // stats panel's `stats-view` and `stats-page`.
+        match SettingsToWorker::from_js(&data) {
+            // Canvas resize (the Settings panel follows the canvas's layout
+            // size and the resolution slider): the worker owns the
+            // OffscreenCanvas, so it applies the new device-pixel size.
+            Some(Ok(SettingsToWorker::Resize { width, height })) => {
+                if width > 0 && height > 0 {
+                    canvas.set_width(width);
+                    canvas.set_height(height);
+                }
+                return;
+            }
+            // An anti-aliasing change: the render loop applies it (a newer
+            // one replaces one not applied yet).
+            Some(Ok(SettingsToWorker::AntiAlias { mode })) => {
+                pending_aa.set(Some(mode));
+                return;
+            }
+            Some(Err(err)) => {
+                post_to_main(&RenderMsg::Error {
+                    message: format!("a settings message did not parse: {err}"),
+                });
+                return;
+            }
+            None => {}
+        }
+        match StatsToWorker::from_js(&data) {
+            Some(Ok(message)) => {
+                // The render loop holds the collector only during a frame,
+                // and a message cannot arrive then (one thread).
+                stats.borrow_mut().handle(message);
+                return;
+            }
+            Some(Err(err)) => {
+                post_to_main(&RenderMsg::Error {
+                    message: format!("a stats message did not parse: {err}"),
+                });
+                return;
+            }
+            None => {}
+        }
         if let Ok(msg) = serde_wasm_bindgen::from_value::<InputMsg>(data.clone()) {
             match msg {
                 InputMsg::Held { mask, down } => input.set_held(mask, down),
@@ -981,48 +867,13 @@ fn install_message_handler(
             camera_queue.borrow_mut().push(t, pose);
             return;
         }
-        if let Ok(DropMsg::Ball { ndc_x, ndc_y }) =
-            serde_wasm_bindgen::from_value::<DropMsg>(data.clone())
+        if let Ok(DropMsg::Ball { ndc_x, ndc_y }) = serde_wasm_bindgen::from_value::<DropMsg>(data)
         {
             drops.borrow_mut().push((ndc_x, ndc_y));
-            return;
-        }
-        if let Ok(ResizeMsg::Canvas { width, height }) =
-            serde_wasm_bindgen::from_value::<ResizeMsg>(data.clone())
-        {
-            if width > 0 && height > 0 {
-                canvas.set_width(width);
-                canvas.set_height(height);
-            }
-            return;
-        }
-        if let Ok(QualityMsg::AntiAlias { msaa, smaa }) =
-            serde_wasm_bindgen::from_value::<QualityMsg>(data.clone())
-        {
-            pending_aa.set(Some((msaa, smaa)));
-            return;
-        }
-        if let Ok(StatsDetailMsg::Set { bits }) =
-            serde_wasm_bindgen::from_value::<StatsDetailMsg>(data)
-        {
-            stats_detail.set(bits);
         }
     });
     scope.set_onmessage(Some(cb.as_ref().unchecked_ref()));
     cb.forget();
-}
-
-/// Map the Settings `(msaa, smaa)` toggle pair onto the renderer's config:
-/// MSAA is 4× or off (the only counts it supports), mipmapping always on.
-/// Used both at BUILD time (the startup prefs, so boot compiles exactly the
-/// variants this session needs — no reconcile recompile) and for runtime
-/// Settings changes.
-fn aa_config((msaa, smaa): (bool, bool)) -> awsm_renderer::anti_alias::AntiAliasing {
-    awsm_renderer::anti_alias::AntiAliasing {
-        msaa_sample_count: if msaa { Some(4) } else { None },
-        smaa,
-        mipmap: true,
-    }
 }
 
 /// Reschedule the render loop for the next frame.
@@ -1293,33 +1144,6 @@ fn worker_performance() -> Result<web_sys::Performance, JsValue> {
         .ok_or_else(|| JsValue::from_str("no performance.now"))
 }
 
-/// Probe the WebGPU adapter for the two facts main needs to size the canvas —
-/// whether it's a software fallback and its max 2D texture dimension — and post
-/// them. Failures degrade to safe defaults (not fallback, the guaranteed 8192).
-async fn report_gpu_info() {
-    use wasm_bindgen_futures::JsFuture;
-    let (is_fallback, max_texture_dim) = match awsm_renderer::web_global::navigator_gpu() {
-        Some(gpu) => match JsFuture::from(gpu.request_adapter()).await {
-            Ok(v) if !v.is_null() && !v.is_undefined() => {
-                let adapter: web_sys::GpuAdapter = v.unchecked_into();
-                (
-                    adapter.info().is_fallback_adapter(),
-                    adapter.limits().max_texture_dimension_2d(),
-                )
-            }
-            _ => (false, 8192),
-        },
-        None => (false, 8192),
-    };
-    tracing::info!(
-        "game worker: gpu info — fallback {is_fallback}, max_texture_2d {max_texture_dim}"
-    );
-    post_to_main(&RenderMsg::GpuInfo {
-        is_fallback,
-        max_texture_dim,
-    });
-}
-
 /// Post a human-readable load-progress line to main (the loading screen).
 fn post_progress(message: &str) {
     post_to_main(&RenderMsg::Progress {
@@ -1340,14 +1164,6 @@ fn post_to_main(msg: &RenderMsg) {
 
 /// Serialize an [`AudioMsg`] cue and post it to main (which owns WebAudio).
 fn post_audio(msg: &AudioMsg) {
-    let scope = js_sys::global().unchecked_into::<web_sys::DedicatedWorkerGlobalScope>();
-    if let Ok(v) = serde_wasm_bindgen::to_value(msg) {
-        let _ = scope.post_message(&v);
-    }
-}
-
-/// Serialize a [`StatsMsg`] and post it to main (the stats panel).
-fn post_stats(msg: &StatsMsg) {
     let scope = js_sys::global().unchecked_into::<web_sys::DedicatedWorkerGlobalScope>();
     if let Ok(v) = serde_wasm_bindgen::to_value(msg) {
         let _ = scope.post_message(&v);

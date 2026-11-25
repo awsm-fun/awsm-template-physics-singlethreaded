@@ -29,9 +29,7 @@ pub mod bootstrap;
 pub mod game;
 pub mod main_thread;
 pub mod physics;
-pub mod profile;
 pub mod protocol;
-pub mod refresh;
 pub mod stats;
 
 use wasm_bindgen::prelude::*;

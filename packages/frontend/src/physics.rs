@@ -31,11 +31,11 @@ use std::ffi::c_void;
 use box3d_sys as b3;
 use wasm_bindgen::prelude::*;
 
-use crate::profile::{StepPhase, StepTimer};
 use crate::protocol::{
     AudioMsg, ColliderInit, ColliderShapeMsg, Input, HELD_BACK, HELD_FORWARD, HELD_LEFT,
     HELD_RIGHT, MAX_BALLS, ROLE_BALL, ROLE_FLOOR, ROLE_WALL, SIM_HZ,
 };
+use crate::stats::{StepPhase, StepTimer};
 
 /// A published body pose: `(position, quaternion)` as plain arrays. The render
 /// side lerps position and slerps rotation between the prev/curr pair.

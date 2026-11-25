@@ -3,14 +3,21 @@
 //!
 //! Flow:
 //! 1. Build the canvas + HUD with Dominator and mount them.
-//! 2. Size the canvas backing store, `transferControlToOffscreen`, and spawn the
-//!    worker with the `OffscreenCanvas` (see [`crate::bootstrap`]).
+//! 2. Ask the GPU what the Settings need (a software adapter, the largest
+//!    texture), size the canvas backing store from the Settings' resolution,
+//!    `transferControlToOffscreen`, and spawn the worker with the
+//!    `OffscreenCanvas` and the anti-aliasing mode (see [`crate::bootstrap`]).
 //! 3. Forward keyboard/pointer input to the worker as [`InputMsg`]/[`CameraMsg`]/
-//!    [`DropMsg`]; forward Settings + layout changes as [`QualityMsg`]/
-//!    [`ResizeMsg`].
+//!    [`DropMsg`]; the Settings modal forwards its changes (resolution,
+//!    anti-aliasing) itself.
 //! 4. Play back the worker's [`AudioMsg`] cues on the WebAudio player, and show
-//!    its [`RenderMsg`]/[`StatsMsg`] on the loading screen + stats panel
-//!    (see `stats`).
+//!    its [`RenderMsg`]s on the loading screen; the kit's panels show its
+//!    `aa-compile-*` and `stats` messages.
+//!
+//! The Settings modal and the Stats panel are awsm-renderer-kit's
+//! (`awsm-renderer-settings`, `awsm-renderer-stats`): this thread shows them
+//! and passes their messages to the worker, which applies the settings and
+//! measures the stats.
 //!
 //! The main thread never renders or steps physics — so heavy frames in the
 //! worker can't jank input or audio, and vice versa. Nothing is shared but
@@ -19,333 +26,164 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use dominator::{clone, html, with_node};
-use futures_signals::signal::{Mutable, SignalExt};
+use awsm_renderer_settings::{
+    probe_gpu, GpuInfo, SettingsConfig, SettingsHooks, SettingsOptions, SettingsPanel,
+    SettingsStore, SettingsToWorker, SettingsUi,
+};
+use awsm_renderer_stats::{StatsHooks, StatsPanel, StatsToWorker};
+use dominator::{clone, html};
+use futures_signals::signal::Mutable;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::js_sys;
-use web_sys::{
-    HtmlCanvasElement, HtmlInputElement, HtmlSelectElement, KeyboardEvent, MessageEvent, Worker,
-};
+use web_sys::{HtmlCanvasElement, HtmlElement, KeyboardEvent, MessageEvent, Worker};
 
 use crate::about::{About, Tab};
 use crate::audio::AudioController;
 use crate::bootstrap::spawn_worker;
 use crate::protocol::{
-    AudioMsg, CameraMsg, CameraPose, DropMsg, InputMsg, QualityMsg, RenderMsg, ResizeMsg,
-    StatsDetailMsg, StatsMsg, HELD_BACK, HELD_FORWARD, HELD_LEFT, HELD_RIGHT,
+    AudioMsg, CameraMsg, CameraPose, DropMsg, InputMsg, RenderMsg, HELD_BACK, HELD_FORWARD,
+    HELD_LEFT, HELD_RIGHT,
 };
-use crate::stats::{PageWork, Panel, Stats};
 
 /// Shared, lazily-loaded audio. `None` until the export finishes loading; stays
 /// silent until a user gesture starts it (browser autoplay policy).
 type Audio = Rc<RefCell<Option<AudioController>>>;
 
-// ── Resolution scale: the one fill-rate lever ────────────────────────────────
-// The canvas renders at `devicePixelRatio × scale` device pixels; the user owns
-// the slider, we pick only the DEFAULT (while they haven't chosen): native
-// resolution capped at a PIXEL BUDGET ([`DEFAULT_PIXEL_BUDGET`]), further capped
-// by device class (touch / software GPU), never below an effective DPR of 1.
-// Native on any desktop was the old default; measured on a Retina M1 Max at
-// native 2400×1794 this scene's GPU frame missed a 120 Hz display's 8.3 ms
-// budget, and the renderer's cost scales with pixels — hence a pixel budget, not a
-// DPR cap. Never below an effective DPR of 1, so DPR-1 displays keep native.
-/// Floor of the slider (50% of native). The slider's `min` in `index.html` mirrors it.
-const MIN_SCALE: f64 = 0.5;
-/// Ceiling: native resolution. We never supersample here.
-const MAX_SCALE: f64 = 1.0;
-/// Start on a touch / `pointer: coarse` device (phones, tablets): high DPR × a
-/// mobile GPU is the case that tanks to ~20fps at native, so seed it down.
-const COARSE_START_SCALE: f64 = 0.6;
-/// Start on a software / fallback adapter — it genuinely can't push pixels, so
-/// seed lower still. Applied when the worker reports the adapter.
-const FALLBACK_START_SCALE: f64 = 0.5;
-/// Backing-store pixels the DEFAULT resolution allows (see the section note).
-/// The user's slider still goes to 100%.
-const DEFAULT_PIXEL_BUDGET: f64 = 2_800_000.0;
-/// Max 2D texture dimension assumed until the worker reports the real one.
-const DEFAULT_MAX_TEX: u32 = 8192;
-/// `localStorage` key for the persisted user choice. Every experiment is served
-/// from the same origin (awsm.fun), so each app's keys carry its own prefix;
-/// change it when starting a new project from this template.
-const RES_STORAGE_KEY: &str = "awsm_box3d_st_res_scale";
+/// The game worker, once spawned. The Settings and Stats panels exist before
+/// it (their messages before then are dropped; both repeat what matters).
+type WorkerRef = Rc<RefCell<Option<Worker>>>;
 
-/// Everything needed to size the canvas backing store: the user's `scale`
-/// fraction, the GPU's texture-dimension cap, and the current CSS size + DPR
-/// (updated by the `ResizeObserver`). `Copy` so it lives in a `Cell`.
-#[derive(Clone, Copy)]
-struct ResState {
-    scale: f64,
-    max_tex: u32,
-    css_w: f64,
-    css_h: f64,
-    dpr: f64,
-    /// Device-class ceiling for the DEFAULT scale: [`MAX_SCALE`], or lower on
-    /// a touch device / software GPU. Never applied over a user choice.
-    auto_cap: f64,
-}
+/// The prefix of every `localStorage` key this app writes: the resolution
+/// (`res_scale`), the anti-aliasing mode (`aa`), the Stats panel (`stats`)
+/// and its groups (`stats_open_<id>`). Every experiment is served from the
+/// same origin (awsm.fun), so each app's keys carry its own prefix; change it
+/// when starting a new project from this template.
+const STORAGE_PREFIX: &str = "awsm_box3d_st_";
 
-impl ResState {
-    /// Backing-store size in device pixels: `css × dpr × scale`, each axis
-    /// clamped to `[1, max_tex]`.
-    fn backing(&self) -> (u32, u32) {
-        let s = (self.dpr * self.scale).max(0.01);
-        let w = ((self.css_w * s).round() as u32).clamp(1, self.max_tex);
-        let h = ((self.css_h * s).round() as u32).clamp(1, self.max_tex);
-        (w, h)
-    }
-
-    /// The default scale for the current size: native, capped by the pixel
-    /// budget and the device-class ceiling, floored at an effective DPR of 1
-    /// (and the slider's range).
-    fn auto_scale(&self) -> f64 {
-        let native_px = self.css_w * self.css_h * self.dpr * self.dpr;
-        let budget = if native_px > DEFAULT_PIXEL_BUDGET {
-            (DEFAULT_PIXEL_BUDGET / native_px)
-                .sqrt()
-                .max(1.0 / self.dpr)
-        } else {
-            MAX_SCALE
-        };
-        // Round DOWN to the slider's 5% step so the thumb, its label and the
-        // real scale agree (the browser would snap an 81% value to 80).
-        let stepped = (budget.min(self.auto_cap) * 20.0).floor() / 20.0;
-        stepped.clamp(MIN_SCALE, MAX_SCALE)
-    }
-}
-
-/// Percent form of a scale fraction (0.6 → 60) — the slider's unit.
-fn pct_of(scale: f64) -> u32 {
-    (scale * 100.0).round() as u32
-}
-
-/// The device-class ceiling for the default scale: lower on a touch device.
-/// (A fallback GPU lowers it further once the worker reports in.)
-fn initial_auto_cap(window: &web_sys::Window) -> f64 {
-    if coarse_pointer(window) {
-        COARSE_START_SCALE
-    } else {
-        MAX_SCALE
-    }
-}
-
-/// A touch / `pointer: coarse` device (phones, tablets) — the device class that
-/// seeds lower graphics defaults. Only DEFAULTS — a stored user choice wins.
-pub(crate) fn coarse_pointer(window: &web_sys::Window) -> bool {
-    window
-        .match_media("(pointer: coarse)")
-        .ok()
-        .flatten()
-        .map(|m| m.matches())
-        .unwrap_or(false)
-}
-
-/// The persisted resolution scale, if the user has set one (clamped to range).
-fn stored_scale(window: &web_sys::Window) -> Option<f64> {
-    let ls = window.local_storage().ok().flatten()?;
-    let raw = ls.get_item(RES_STORAGE_KEY).ok().flatten()?;
-    raw.parse::<f64>()
-        .ok()
-        .map(|v| v.clamp(MIN_SCALE, MAX_SCALE))
-}
-
-/// Persist the user's resolution scale (only user drags call this).
-fn store_scale(window: &web_sys::Window, scale: f64) {
-    if let Ok(Some(ls)) = window.local_storage() {
-        let _ = ls.set_item(RES_STORAGE_KEY, &format!("{scale:.2}"));
-    }
-}
-
-// ── Anti-aliasing setting ────────────────────────────────────────────────────
-// ONE three-way choice in the Settings modal, persisted: Off / SMAA / MSAA 4×.
-// MSAA+SMAA together isn't offered: on top of a 4× MSAA resolve SMAA buys
-// almost nothing (the renderer itself defaults it off) and costs an extra
-// full-screen pre-pass. SMAA earns its place as the cheap AA when MSAA is off.
-const AA_STORAGE_KEY: &str = "awsm_box3d_st_aa";
-/// The pre-0.42 per-toggle keys — migrated to [`AA_STORAGE_KEY`] once, then
-/// cleared (see [`clear_legacy_aa`]).
-const LEGACY_AA_STORAGE_KEYS: [&str; 2] = ["awsm_msaa", "awsm_smaa"];
-/// `localStorage` key for the stats-panel toggle (default OFF — the panel eats a
-/// lot of a phone screen, so it's opt-in via the bottom-left Stats chip).
-/// Each panel group's open state is stored under it too (see `stats`).
-pub(crate) const STATS_STORAGE_KEY: &str = "awsm_box3d_st_stats";
-/// The element id of the reduced-quality notice (see `quality_notice_modal`).
+/// The element id of the reduced-quality notice (awsm-renderer-settings
+/// builds it): the About modal leaves Escape to it while it is up.
 pub(crate) const QUALITY_NOTICE_ID: &str = "quality-notice";
-/// The anti-aliasing modes the Settings modal offers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AaMode {
-    Off,
-    Smaa,
-    Msaa,
+
+/// The pre-0.42 per-toggle anti-aliasing keys (no app prefix), migrated to
+/// `<prefix>aa` once and then removed.
+const LEGACY_AA_KEYS: (&str, &str) = ("awsm_msaa", "awsm_smaa");
+
+/// The name of the camera frame loop in the Stats panel's page group.
+const PAGE_FRAME_PART: &str = "camera frame loop";
+/// The name of the sound cues in the Stats panel's page group.
+const PAGE_CUES_PART: &str = "sound cues";
+
+/// The graphics Settings this app offers (awsm-renderer-settings' defaults):
+///
+/// - **Anti-aliasing**: Off, SMAA, MSAA 4×, TAA, and the TAA upscaling
+///   presets Quality (67%), Balanced (58%) and Performance (50%). TAA is the
+///   default on a desktop; a touch device and a software GPU start with Off
+///   (they optimize for frame rate, and a one-time notice on a touch device
+///   points at Settings). A stored choice always wins, and `?aa=<id>`
+///   overrides it for one session.
+/// - **Resolution** (the fill-rate lever): the canvas renders at
+///   `devicePixelRatio × scale` device pixels, 50–100% in 5% steps. The
+///   default is native resolution capped at a 2.8 MP pixel budget (never
+///   below an effective DPR of 1), and lower on a touch device (60%) or a
+///   software GPU (50%). TAA's upscaling presets scale the renderer's
+///   internal size on top of it.
+fn settings_config() -> SettingsConfig {
+    SettingsConfig::default()
 }
 
-impl AaMode {
-    const ALL: [AaMode; 3] = [AaMode::Off, AaMode::Smaa, AaMode::Msaa];
-
-    /// The renderer's `(msaa, smaa)` pair for this mode.
-    fn flags(self) -> (bool, bool) {
-        match self {
-            AaMode::Off => (false, false),
-            AaMode::Smaa => (false, true),
-            AaMode::Msaa => (true, false),
-        }
-    }
-
-    /// Storage / `<option>` value.
-    fn key(self) -> &'static str {
-        match self {
-            AaMode::Off => "off",
-            AaMode::Smaa => "smaa",
-            AaMode::Msaa => "msaa",
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            AaMode::Off => "Off",
-            AaMode::Smaa => "SMAA",
-            AaMode::Msaa => "MSAA 4×",
-        }
-    }
-
-    fn parse(s: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|m| m.key() == s)
-    }
-}
-
-/// Default anti-aliasing on a fine-pointer (desktop) device. On
-/// `pointer: coarse` devices it defaults to [`AaMode::Off`] instead: like the
-/// [`COARSE_START_SCALE`] resolution seed, the mobile defaults optimize
-/// purely for frame rate — and because that visibly costs quality, a notice
-/// modal points the user at Settings (see `quality_notice_modal`). A stored
-/// user choice always wins over either default.
-const AA_DEFAULT: AaMode = AaMode::Msaa;
-
-/// The persisted anti-aliasing choice, if the user has made one.
-fn stored_aa(window: &web_sys::Window) -> Option<AaMode> {
-    let ls = window.local_storage().ok().flatten()?;
-    AaMode::parse(&ls.get_item(AA_STORAGE_KEY).ok().flatten()?)
-}
-
-/// Persist the user's anti-aliasing choice.
-fn store_aa(window: &web_sys::Window, mode: AaMode) {
-    if let Ok(Some(ls)) = window.local_storage() {
-        let _ = ls.set_item(AA_STORAGE_KEY, mode.key());
-    }
-}
-
-/// Carry an explicit pre-0.42 choice over to [`AA_STORAGE_KEY`], then drop the
-/// legacy per-toggle keys (see [`LEGACY_AA_STORAGE_KEYS`]). The old keys were
-/// only ever written by a user toggle, so they are real choices: MSAA off maps
-/// to SMAA if SMAA was on, else Off; MSAA on maps to MSAA (SMAA alongside it
-/// isn't offered any more). Unset legacy keys leave the new default in place.
-fn clear_legacy_aa(window: &web_sys::Window) {
-    let Ok(Some(ls)) = window.local_storage() else {
-        return;
-    };
-    let get = |k: &str| ls.get_item(k).ok().flatten();
-    let (msaa, smaa) = (
-        get(LEGACY_AA_STORAGE_KEYS[0]),
-        get(LEGACY_AA_STORAGE_KEYS[1]),
-    );
-    if get(AA_STORAGE_KEY).is_none() {
-        let migrated = match (msaa.as_deref(), smaa.as_deref()) {
-            (Some("1"), _) => Some(AaMode::Msaa),
-            (Some("0"), Some("1")) => Some(AaMode::Smaa),
-            (Some("0"), _) => Some(AaMode::Off),
-            (None, Some("1")) => Some(AaMode::Msaa),
-            _ => None,
-        };
-        if let Some(mode) = migrated {
-            let _ = ls.set_item(AA_STORAGE_KEY, mode.key());
-        }
-    }
-    for key in LEGACY_AA_STORAGE_KEYS {
-        let _ = ls.remove_item(key);
-    }
-}
-
-/// Read a persisted boolean setting (`"1"`/`"0"`), `None` if unset.
-pub(crate) fn stored_bool(window: &web_sys::Window, key: &str) -> Option<bool> {
-    let ls = window.local_storage().ok().flatten()?;
-    match ls.get_item(key).ok().flatten()?.as_str() {
-        "1" => Some(true),
-        "0" => Some(false),
-        _ => None,
-    }
-}
-
-/// Persist a boolean setting.
-pub(crate) fn store_bool(window: &web_sys::Window, key: &str, val: bool) {
-    if let Ok(Some(ls)) = window.local_storage() {
-        let _ = ls.set_item(key, if val { "1" } else { "0" });
-    }
-}
-
-/// `?reset` in the URL wipes every persisted app setting so the load boots with
-/// fresh defaults. Must run before ANY stored value is read.
-fn maybe_reset_settings(window: &web_sys::Window) {
-    let has_reset = window
-        .location()
-        .search()
-        .ok()
-        .and_then(|s| web_sys::UrlSearchParams::new_with_str(&s).ok())
-        .map(|p| p.get("reset").is_some())
-        .unwrap_or(false);
-    if !has_reset {
-        return;
-    }
-    if let Ok(Some(ls)) = window.local_storage() {
-        for key in [
-            RES_STORAGE_KEY,
-            AA_STORAGE_KEY,
-            LEGACY_AA_STORAGE_KEYS[0],
-            LEGACY_AA_STORAGE_KEYS[1],
-            STATS_STORAGE_KEY,
-        ] {
-            let _ = ls.remove_item(key);
-        }
-        for key in crate::stats::open_keys() {
-            let _ = ls.remove_item(&key);
-        }
-    }
-    loading_log("?reset — stored settings cleared, booting with defaults");
-}
-
-/// Serialize a message and post it to the worker.
 fn post<T: Serialize>(worker: &Worker, msg: &T) {
     if let Ok(v) = serde_wasm_bindgen::to_value(msg) {
         let _ = worker.post_message(&v);
     }
 }
 
-/// Post the backing-store size for `st` to the worker (it owns the OffscreenCanvas).
-fn post_resize(worker: &Worker, st: &ResState) {
-    let (width, height) = st.backing();
-    post(worker, &ResizeMsg::Canvas { width, height });
+/// Posts one of the kit's messages (already a JS value) to the worker.
+fn post_kit(worker: &Worker, message: Result<JsValue, String>) {
+    match message {
+        Ok(value) => {
+            let _ = worker.post_message(&value);
+        }
+        Err(err) => tracing::error!("kit message: {err}"),
+    }
+}
+
+/// A new `<tag class="class">`.
+fn element(tag: &str, class: &str) -> HtmlElement {
+    let el: HtmlElement = dominator::body()
+        .owner_document()
+        .and_then(|d| d.create_element(tag).ok())
+        .expect("create_element")
+        .unchecked_into();
+    el.set_class_name(class);
+    el
 }
 
 /// Build + mount the DOM, then spawn the game worker.
 pub fn start() -> Result<(), JsValue> {
-    if let Some(window) = web_sys::window() {
-        maybe_reset_settings(&window);
+    // `?reset` in the URL forgets every stored setting (resolution,
+    // anti-aliasing, the stats panel and its groups) so the load boots with
+    // fresh defaults. It runs before anything reads a stored value.
+    let store =
+        SettingsStore::new(STORAGE_PREFIX).with_legacy_aa_keys(LEGACY_AA_KEYS.0, LEGACY_AA_KEYS.1);
+    if store.reset_if_asked() {
+        loading_log("?reset — stored settings cleared, booting with defaults");
     }
+    store.migrate_legacy_aa();
+
     let status = Mutable::new("booting…".to_string());
-    // The Stats panel (hidden by default; see `stats`).
-    let stats = Panel::new();
     let about = About::default();
+    let worker_ref: WorkerRef = Rc::new(RefCell::new(None));
+
+    // The Stats panel (top right, hidden by default) and the bottom-left
+    // Stats button. awsm-renderer-stats fills the panel from the worker's
+    // reports; it sends the worker which groups are open (only those are
+    // measured in detail) and what it measured here (its frame gaps for the
+    // refresh rate, and this thread's own work).
+    let stats_el = element("div", "stats");
+    let stats_button = element("button", "stats-btn");
+    let _ = stats_button.set_attribute("type", "button");
+    stats_button.set_text_content(Some("Stats"));
+    let stats = StatsPanel::mount(
+        STORAGE_PREFIX,
+        &stats_el,
+        Some(&stats_button),
+        StatsHooks {
+            post: Box::new(clone!(worker_ref => move |message: &StatsToWorker| {
+                if let Some(worker) = worker_ref.borrow().as_ref() {
+                    post_kit(worker, message.to_js());
+                }
+            })),
+            on_help: Some(Box::new(clone!(about => move || about.show(Tab::Stats)))),
+            page_part: PAGE_FRAME_PART.to_string(),
+            app_sections: None,
+            section_rows: None,
+            shown: None,
+        },
+    );
     loading_log("wasm compiled — booting");
 
     let app = html!("div", {
         .child(html!("canvas" => HtmlCanvasElement, {
             .class("canvas")
-            .after_inserted(clone!(status, stats => move |canvas| {
-                if let Err(e) = setup(canvas, status.clone(), stats.clone()) {
-                    status.set(format!("setup error: {e:?}"));
-                    tracing::error!("setup: {e:?}");
-                }
+            .after_inserted(clone!(status, stats, worker_ref => move |canvas| {
+                // The GPU probe first: the Settings' defaults depend on it (a
+                // software adapter starts lower), and the canvas is sized
+                // from them before it goes to the worker.
+                spawn_local(async move {
+                    let gpu = probe_gpu().await;
+                    tracing::info!(
+                        "gpu — fallback adapter {}, largest 2D texture {}",
+                        gpu.is_fallback,
+                        gpu.max_texture_dim
+                    );
+                    if let Err(e) = setup(canvas, status.clone(), stats, store, gpu, worker_ref) {
+                        status.set(format!("setup error: {e:?}"));
+                        tracing::error!("setup: {e:?}");
+                    }
+                });
             }))
         }))
         .child(html!("div", {
@@ -355,90 +193,14 @@ pub fn start() -> Result<(), JsValue> {
                 .text_signal(status.signal_cloned())
             }))
         }))
-        .child(stats.dom(clone!(about => move || about.show(Tab::Stats))))
-        .child(stats.button())
+        .child(dominator::DomBuilder::new(stats_el).into_dom())
+        .child(dominator::DomBuilder::new(stats_button).into_dom())
         .child(about.button())
         .child(about.modal())
     });
 
     dominator::append_dom(&dominator::body(), app);
     Ok(())
-}
-
-/// The one-time reduced-quality notice for touch devices.
-fn quality_notice_modal(open: &Mutable<bool>) -> dominator::Dom {
-    html!("div", {
-        .class("settings-overlay")
-        .attr("id", QUALITY_NOTICE_ID)
-        // Above the About modal, which may already be open when this shows.
-        .style("z-index", "25")
-        .visible_signal(open.signal())
-        .event_with_options(&dominator::EventOptions::bubbles(), keep_keys_in_modal)
-        .event(clone!(open => move |e: dominator::events::Click| {
-            let on_backdrop = e
-                .dyn_target::<web_sys::Element>()
-                .map(|el| el.class_list().contains("settings-overlay"))
-                .unwrap_or(false);
-            if on_backdrop {
-                open.set_neq(false);
-            }
-        }))
-        .global_event(clone!(open => move |e: dominator::events::KeyDown| {
-            if e.key() == "Escape" {
-                open.set_neq(false);
-            }
-        }))
-        .child(html!("div", {
-            .class("settings-modal")
-            .child(html!("button", {
-                .class("about-close")
-                .attr("aria-label", "Close")
-                .text("×")
-                .event(clone!(open => move |_: dominator::events::Click| open.set_neq(false)))
-            }))
-            .child(html!("h2", { .text("Display Quality Reduced") }))
-            .child(html!("p", {
-                .class("notice-text")
-                .text("Display quality was reduced to keep the frame rate up on \
-                       touch devices. You can adjust the resolution and \
-                       anti-aliasing any time in Settings (bottom right).")
-            }))
-            .child(html!("button", {
-                .class("notice-ok")
-                .text("OK")
-                .event(clone!(open => move |_: dominator::events::Click| open.set_neq(false)))
-            }))
-        }))
-    })
-}
-
-/// The blocking "compiling pipelines" overlay, raised while the worker
-/// recompiles for a Settings anti-aliasing change
-/// ([`RenderMsg::AaCompileStart`] → [`RenderMsg::AaCompileDone`]). Not
-/// user-dismissable — it lowers itself when the worker reports done. `None` =
-/// hidden; `Some(line)` = shown, with the worker's live progress line.
-fn aa_compile_modal(state: &Mutable<Option<String>>) -> dominator::Dom {
-    html!("div", {
-        .class("settings-overlay")
-        // Above the Settings modal that triggered it (both are z-index 20).
-        .style("z-index", "30")
-        .visible_signal(state.signal_cloned().map(|s| s.is_some()))
-        .child(html!("div", {
-            .class("settings-modal")
-            .child(html!("h2", { .text("Compiling Pipelines") }))
-            .child(html!("p", {
-                .class("notice-text")
-                .text("Rebuilding the render pipelines for the new \
-                       anti-aliasing settings. The first switch in each \
-                       direction compiles shaders; after that it's cached and \
-                       instant.")
-            }))
-            .child(html!("p", {
-                .class("settings-hint")
-                .text_signal(state.signal_cloned().map(|s| s.unwrap_or_default()))
-            }))
-        }))
-    })
 }
 
 /// Append a line to the loading screen's log (`#loading-log` in index.html).
@@ -492,46 +254,41 @@ pub fn fatal(message: &str) {
     dominator::append_dom(&dominator::body(), app);
 }
 
-/// Runs once the canvas is in the DOM: size it, transfer it to the worker, and
-/// wire input + the worker message bridge.
+/// Runs once the canvas is in the DOM and the GPU has been probed: size it,
+/// transfer it to the worker, and wire input, the Settings and the worker
+/// message bridge.
 fn setup(
     canvas: HtmlCanvasElement,
     status: Mutable<String>,
-    panel: Rc<Panel>,
+    stats: StatsPanel,
+    store: SettingsStore,
+    gpu: GpuInfo,
+    worker_ref: WorkerRef,
 ) -> Result<(), JsValue> {
     let window = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?;
 
-    // ── Resolution scale (the fill-rate lever) ──────────────────────────────
-    let mut res0 = ResState {
-        scale: MAX_SCALE,
-        max_tex: DEFAULT_MAX_TEX,
-        css_w: canvas.client_width().max(1) as f64,
-        css_h: canvas.client_height().max(1) as f64,
-        dpr: window.device_pixel_ratio().max(1.0),
-        auto_cap: initial_auto_cap(&window),
-    };
-    // A stored user choice wins; otherwise the budgeted default.
-    res0.scale = stored_scale(&window).unwrap_or_else(|| res0.auto_scale());
-    let res = Rc::new(Cell::new(res0));
-    let user_pref = Rc::new(Cell::new(stored_scale(&window).is_some()));
-    let res_pct = Mutable::new(pct_of(res.get().scale));
-
-    // Anti-aliasing mode (persisted). Coarse-pointer devices default to Off.
-    let coarse = coarse_pointer(&window);
-    clear_legacy_aa(&window);
-    let aa =
-        Mutable::new(stored_aa(&window).unwrap_or(if coarse { AaMode::Off } else { AA_DEFAULT }));
-    // Reduced-quality notice (touch devices): shown when the coarse seeds applied.
-    let show_quality_notice =
-        coarse && (stored_scale(&window).is_none() || stored_aa(&window).is_none());
-    let notice_open = Mutable::new(false);
-    dominator::append_dom(&dominator::body(), quality_notice_modal(&notice_open));
-    // The "compiling pipelines" overlay for runtime AA changes (worker-driven).
-    let aa_compile: Mutable<Option<String>> = Mutable::new(None);
-    dominator::append_dom(&dominator::body(), aa_compile_modal(&aa_compile));
+    // ── Settings: resolution + anti-aliasing (awsm-renderer-settings) ───────
+    // The stored choices (or `?aa=`, or the device defaults: touch and the
+    // software GPU probed above start lower) give the first canvas size and
+    // mode; the bottom-right Settings modal changes them live and stores
+    // them. The modal, the reduced-quality notice and the "compiling
+    // pipelines" overlay go into the body, after the Settings button.
+    let body = dominator::body();
+    let settings_button = element("button", "settings-btn");
+    let _ = settings_button.set_attribute("type", "button");
+    settings_button.set_text_content(Some("Settings"));
+    body.append_child(&settings_button)?;
+    let settings = SettingsPanel::new(
+        &body,
+        &canvas,
+        store,
+        &SettingsOptions::new(&settings_config(), Some(gpu)),
+        SettingsUi::default(),
+        loading_log,
+    );
 
     // Size the backing store, then transfer the canvas to the worker.
-    let (w, h) = res.get().backing();
+    let (w, h) = settings.backing();
     canvas.set_width(w);
     canvas.set_height(h);
     let offscreen = canvas.transfer_control_to_offscreen()?;
@@ -562,8 +319,8 @@ fn setup(
     }));
 
     // Payload for the worker: the transferred OffscreenCanvas, the asset base,
-    // and the desired startup anti-aliasing (so the worker seeds it with no
-    // round-trip / race).
+    // and the startup anti-aliasing mode (so the worker builds with it, with
+    // no round-trip / race).
     let payload = js_sys::Object::new();
     set(&payload, "canvas", &offscreen);
     set(&payload, "origin", &JsValue::from_str(&base));
@@ -576,43 +333,32 @@ fn setup(
     // CDN like `/experiments/<slug>/`) the files live under that directory, so a
     // bare origin would 404. See `game.rs` configure(...).
     set(&payload, "app_base", &JsValue::from_str(&app_base(&window)));
-    let (msaa0, smaa0) = aa.get().flags();
-    set(&payload, "msaa", &JsValue::from_bool(msaa0));
-    set(&payload, "smaa", &JsValue::from_bool(smaa0));
+    set(&payload, "aa", &JsValue::from_str(settings.aa().id()));
     let transfer = js_sys::Array::new();
     transfer.push(&offscreen);
 
-    // The worker handle, published after spawn so the message handler (installed
-    // as the worker's onmessage, hence built before it exists) can post a resize
-    // back on `GpuInfo`. Set synchronously right after spawn.
-    let worker_ref: Rc<RefCell<Option<Worker>>> = Rc::new(RefCell::new(None));
-
-    // The display's refresh period, measured by a rAF loop of the main
-    // thread's own (see `refresh`), and this thread's own per-frame work:
-    // with the worker's `StatsMsg`s, everything the Stats panel shows.
-    let refresh = crate::refresh::install(&window)?;
-    let page_work = Rc::new(PageWork::default());
-    let stats = Rc::new(Stats::new(panel.clone(), page_work.clone(), refresh));
+    // This thread's time on sound cues since its last frame (the Stats
+    // panel's page group).
+    let cues_ms = Rc::new(Cell::new(0.0));
     let perf = window
         .performance()
         .ok_or_else(|| JsValue::from_str("no performance"))?;
 
-    // Handle messages coming back from the worker.
+    // Handle messages coming back from the worker: the kit's (the "compiling
+    // pipelines" overlay, the stats reports) first, then ours.
     let on_msg = Closure::<dyn FnMut(MessageEvent)>::new(
-        clone!(audio, status, stats, panel, page_work, perf, res, user_pref, res_pct, worker_ref, notice_open, aa_compile => move |e: MessageEvent| {
+        clone!(audio, status, settings, stats, cues_ms, perf => move |e: MessageEvent| {
             let data = e.data();
+            if settings.handle_js(&data) || stats.handle_js(&data) {
+                return;
+            }
             // Audio cue → the WebAudio player.
             let t0 = perf.now();
             if let Ok(msg) = serde_wasm_bindgen::from_value::<AudioMsg>(data.clone()) {
                 if let Some(c) = audio.borrow_mut().as_mut() {
                     c.on_audio(msg);
                 }
-                page_work.cues(perf.now() - t0);
-                return;
-            }
-            // Sampled engine stats → the panel.
-            if let Ok(msg) = serde_wasm_bindgen::from_value::<StatsMsg>(data.clone()) {
-                stats.on_stats(&msg);
+                cues_ms.set(cues_ms.get() + perf.now() - t0);
                 return;
             }
             match serde_wasm_bindgen::from_value::<RenderMsg>(data) {
@@ -620,49 +366,11 @@ fn setup(
                 Ok(RenderMsg::Ready) => {
                     loading_log("first frames rendered — ready");
                     loading_done();
-                    stats.ready();
-                    // Anything posted before the worker's handler was up is
-                    // lost: tell it again what the Stats panel shows.
-                    if let Some(wk) = worker_ref.borrow().as_ref() {
-                        post(wk, &StatsDetailMsg::Set { bits: panel.detail() });
-                    }
                     status.set("playing — roll · Space jump · click drops a ball · right-drag orbit".into());
-                    if show_quality_notice {
-                        notice_open.set_neq(true);
-                    }
+                    // The game is visible now — if this load applied the
+                    // reduced touch-device defaults, say so.
+                    settings.ready();
                 }
-                Ok(RenderMsg::GpuInfo { is_fallback, max_texture_dim }) => {
-                    let mut st = res.get();
-                    st.max_tex = max_texture_dim.max(1);
-                    // A software adapter can't push pixels — seed lower, but
-                    // never override a choice the user has already made.
-                    if is_fallback {
-                        st.auto_cap = st.auto_cap.min(FALLBACK_START_SCALE);
-                        if !user_pref.get() && st.scale > st.auto_scale() {
-                            st.scale = st.auto_scale();
-                            res_pct.set(pct_of(st.scale));
-                            loading_log(&format!(
-                                "software GPU detected — starting at {}% resolution",
-                                pct_of(st.scale)
-                            ));
-                        }
-                    }
-                    res.set(st);
-                    if let Some(wk) = worker_ref.borrow().as_ref() {
-                        post_resize(wk, &st);
-                    }
-                }
-                Ok(RenderMsg::AaCompileStart { msaa, smaa }) => {
-                    aa_compile.set(Some(format!(
-                        "MSAA 4× {} · SMAA {}",
-                        if msaa { "on" } else { "off" },
-                        if smaa { "on" } else { "off" }
-                    )));
-                }
-                Ok(RenderMsg::AaCompileProgress { message }) => {
-                    aa_compile.set(Some(message));
-                }
-                Ok(RenderMsg::AaCompileDone) => aa_compile.set(None),
                 Ok(RenderMsg::Error { message }) => {
                     loading_log(&format!("ERROR: {message}"));
                     status.set(format!("worker error: {message}"));
@@ -675,17 +383,8 @@ fn setup(
     loading_log("spawning game worker…");
     let worker = spawn_worker(&payload, &transfer, on_msg.as_ref().unchecked_ref())?;
     on_msg.forget();
+    // Publish the handle for the Stats panel's messages.
     *worker_ref.borrow_mut() = Some(worker.clone());
-    // Tell the worker which Stats breakdowns to measure whenever a group is
-    // toggled or the panel shown/hidden.
-    spawn_local(
-        panel
-            .detail_signal()
-            .for_each(clone!(worker => move |bits| {
-                post(&worker, &StatsDetailMsg::Set { bits });
-                async {}
-            })),
-    );
 
     // Keyboard → InputMsg; a keypress also starts audio.
     install_keyboard(&window, worker.clone(), audio.clone())?;
@@ -694,26 +393,25 @@ fn setup(
     // only allows it once the parent has focused the frame (the awsm.fun
     // shell does), and otherwise the first press on the canvas does it.
     let _ = window.focus();
-    // Canvas layout size → ResizeMsg (backing store in device pixels).
-    install_resize(
-        &window,
+    // The Settings start following the canvas's layout size (the backing
+    // store is CSS size × dpr × the resolution scale) and their controls;
+    // every change goes to the worker, which owns the OffscreenCanvas and the
+    // renderer.
+    settings.start(
         &canvas,
-        worker.clone(),
-        res.clone(),
-        user_pref.clone(),
-        res_pct.clone(),
-    )?;
-    // Settings modal: resolution slider (→ ResizeMsg) + AA mode (→ QualityMsg).
-    install_settings(
-        window.clone(),
-        worker.clone(),
-        res.clone(),
-        user_pref,
-        res_pct,
-        aa,
-    )?;
+        SettingsHooks {
+            on_resize: Box::new(clone!(worker => move |width, height| {
+                post_kit(&worker, SettingsToWorker::Resize { width, height }.to_js());
+            })),
+            on_anti_alias: Box::new(clone!(worker => move |mode| {
+                post_kit(&worker, SettingsToWorker::AntiAlias { mode }.to_js());
+            })),
+            open_button: Some(settings_button.into()),
+            extra_rows: Vec::new(),
+        },
+    );
     // Camera pose → the worker, once per main frame while it changes.
-    install_camera(&window, worker.clone(), camera.clone(), page_work)?;
+    install_camera(&window, worker.clone(), camera.clone(), stats, cues_ms)?;
     // Pointer: click drops a ball, right-drag orbits, wheel zooms, touch flings.
     install_pointer(&window, &canvas, worker, audio, camera)?;
 
@@ -723,159 +421,6 @@ fn setup(
 
 fn set(obj: &js_sys::Object, key: &str, value: &JsValue) {
     let _ = js_sys::Reflect::set(obj, &JsValue::from_str(key), value);
-}
-
-/// Observe the canvas element's layout size and relay the backing-store size to
-/// the worker at the current resolution scale.
-fn install_resize(
-    window: &web_sys::Window,
-    canvas: &HtmlCanvasElement,
-    worker: Worker,
-    res: Rc<Cell<ResState>>,
-    user_pref: Rc<Cell<bool>>,
-    res_pct: Mutable<u32>,
-) -> Result<(), JsValue> {
-    let win = window.clone();
-    let cb = Closure::<dyn FnMut(js_sys::Array)>::new(move |entries: js_sys::Array| {
-        let Ok(entry) = entries.get(0).dyn_into::<web_sys::ResizeObserverEntry>() else {
-            return;
-        };
-        let rect = entry.content_rect();
-        let mut st = res.get();
-        st.dpr = win.device_pixel_ratio().max(1.0);
-        st.css_w = rect.width().max(1.0);
-        st.css_h = rect.height().max(1.0);
-        // The default resolution is size-dependent (pixel budget): re-derive
-        // it — but never over a user's slider choice.
-        if !user_pref.get() {
-            st.scale = st.auto_scale();
-            res_pct.set_neq(pct_of(st.scale));
-        }
-        res.set(st);
-        post_resize(&worker, &st);
-    });
-    let observer = web_sys::ResizeObserver::new(cb.as_ref().unchecked_ref())?;
-    observer.observe(canvas);
-    cb.forget();
-    std::mem::forget(observer);
-    Ok(())
-}
-
-/// The bottom-right **Settings** button + modal: the resolution slider (→
-/// [`ResizeMsg`]) plus the MSAA / SMAA toggles (→ [`QualityMsg`]). Everything
-/// here trades GPU cost for image quality; changes apply live and persist.
-#[allow(clippy::too_many_arguments)]
-fn install_settings(
-    window: web_sys::Window,
-    worker: Worker,
-    res: Rc<Cell<ResState>>,
-    user_pref: Rc<Cell<bool>>,
-    res_pct: Mutable<u32>,
-    aa: Mutable<AaMode>,
-) -> Result<(), JsValue> {
-    let open = Mutable::new(false);
-
-    let button = html!("button", {
-        .class("settings-btn")
-        .text("Settings")
-        .event(clone!(open => move |_: dominator::events::Click| open.set_neq(true)))
-    });
-
-    let resolution_row = html!("div", {
-        .class("settings-row")
-        .child(html!("label", {
-            .class("settings-label")
-            .text_signal(res_pct.signal().map(|p| format!("Resolution — {p}%")))
-        }))
-        .child(html!("input" => HtmlInputElement, {
-            .class("res-slider")
-            .attr("type", "range")
-            .attr("min", "50")
-            .attr("max", "100")
-            .attr("step", "5")
-            .attr("aria-label", "render resolution")
-            .prop_signal("value", res_pct.signal().map(|p| p.to_string()))
-            .with_node!(el => {
-                .event(clone!(res, user_pref, res_pct, window, worker => move |_: dominator::events::Input| {
-                    let pct = el.value().parse::<f64>().unwrap_or(100.0);
-                    let scale = (pct / 100.0).clamp(MIN_SCALE, MAX_SCALE);
-                    let mut st = res.get();
-                    st.scale = scale;
-                    res.set(st);
-                    user_pref.set(true);
-                    res_pct.set(pct_of(scale));
-                    store_scale(&window, scale);
-                    post_resize(&worker, &st);
-                }))
-            })
-        }))
-    });
-
-    // Anti-aliasing: one three-way choice (see [`AaMode`]). A change persists
-    // and posts the renderer's `(msaa, smaa)` pair to the worker.
-    let aa_row = html!("div", {
-        .class("settings-row")
-        .child(html!("label", { .class("settings-label").text("Anti-aliasing") }))
-        .child(html!("select" => HtmlSelectElement, {
-            .class("settings-select")
-            .attr("aria-label", "anti-aliasing")
-            .children(AaMode::ALL.into_iter().map(|m| html!("option", {
-                .attr("value", m.key())
-                .text(m.label())
-            })))
-            .prop_signal("value", aa.signal().map(|m| m.key().to_string()))
-            .with_node!(el => {
-                .event(clone!(aa, window, worker => move |_: dominator::events::Change| {
-                    let Some(mode) = AaMode::parse(&el.value()) else { return };
-                    if aa.replace(mode) != mode {
-                        store_aa(&window, mode);
-                        let (msaa, smaa) = mode.flags();
-                        post(&worker, &QualityMsg::AntiAlias { msaa, smaa });
-                    }
-                }))
-            })
-        }))
-    });
-
-    let modal = html!("div", {
-        .class("settings-overlay")
-        .visible_signal(open.signal())
-        .event_with_options(&dominator::EventOptions::bubbles(), keep_keys_in_modal)
-        .event(clone!(open => move |e: dominator::events::Click| {
-            let on_backdrop = e
-                .dyn_target::<web_sys::Element>()
-                .map(|el| el.class_list().contains("settings-overlay"))
-                .unwrap_or(false);
-            if on_backdrop {
-                open.set_neq(false);
-            }
-        }))
-        .global_event(clone!(open => move |e: dominator::events::KeyDown| {
-            if e.key() == "Escape" {
-                open.set_neq(false);
-            }
-        }))
-        .child(html!("div", {
-            .class("settings-modal")
-            .child(html!("button", {
-                .class("about-close")
-                .attr("aria-label", "Close")
-                .text("×")
-                .event(clone!(open => move |_: dominator::events::Click| open.set_neq(false)))
-            }))
-            .child(html!("h2", { .text("Settings") }))
-            .child(resolution_row)
-            .child(aa_row)
-            .child(html!("p", {
-                .class("settings-hint")
-                .text("Adjust these settings if your framerate is low.")
-            }))
-        }))
-    });
-
-    dominator::append_dom(&dominator::body(), button);
-    dominator::append_dom(&dominator::body(), modal);
-    Ok(())
 }
 
 // ── Touch fling tuning ───────────────────────────────────────────────────────
@@ -905,7 +450,8 @@ fn install_camera(
     window: &web_sys::Window,
     worker: Worker,
     camera: Rc<Cell<CameraPose>>,
-    page_work: Rc<PageWork>,
+    stats: StatsPanel,
+    cues_ms: Rc<Cell<f64>>,
 ) -> Result<(), JsValue> {
     type FrameLoop = Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>>;
     let perf = window
@@ -930,7 +476,10 @@ fn install_camera(
                 },
             );
         }
-        page_work.frame(perf.now() - t0);
+        // This thread's own work, for the Stats panel's page group: the
+        // camera post, and the sound cues played since the last frame.
+        stats.page_frame(perf.now() - t0, Some(PAGE_FRAME_PART), true);
+        stats.page_frame(cues_ms.take(), Some(PAGE_CUES_PART), false);
         if let Some(f) = next.borrow().as_ref() {
             let _ = win.request_animation_frame(f.as_ref().unchecked_ref());
         }

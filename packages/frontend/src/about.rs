@@ -8,7 +8,29 @@ use wasm_bindgen::JsCast;
 use web_sys::HtmlElement;
 
 use crate::main_thread::{keep_keys_in_modal, QUALITY_NOTICE_ID};
-use crate::stats::Lane;
+
+/// A lane of the Stats panel's frame budget: the GPU or a thread. Its colour
+/// (index.html, `--lane-*`) marks its section here as it marks its group in
+/// the panel.
+#[derive(Clone, Copy)]
+enum Lane {
+    Gpu,
+    /// The game worker: the renderer and physics groups are both this one
+    /// thread, so both carry its colour.
+    Sim,
+    Page,
+}
+
+impl Lane {
+    /// The `data-lane` attribute that picks the colour.
+    fn attr(self) -> &'static str {
+        match self {
+            Lane::Gpu => "gpu",
+            Lane::Sim => "sim",
+            Lane::Page => "page",
+        }
+    }
+}
 
 const REPO: &str = "https://github.com/awsm-fun/awsm-template-physics-singlethreaded";
 
