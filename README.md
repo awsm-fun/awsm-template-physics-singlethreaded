@@ -85,9 +85,9 @@ by `postMessage` (see [Data flow](#data-flow)).
 
 | Module | File | Thread | Responsibility |
 |---|---|---|---|
-| **App shell** | `packages/frontend/src/main_thread.rs` | main | Owns the DOM (built with **Dominator**) + keyboard/pointer input, the settings/stats UI, and the **WebAudio player** (`packages/frontend/src/audio.rs`). Sizes the canvas, `transferControlToOffscreen`, and spawns the worker. Forwards input as messages; plays back the worker's audio cues. |
+| **App shell** | `packages/frontend/src/main_thread.rs` | main | Owns the DOM (built with **Dominator**) + keyboard/pointer input, the Settings modal and Stats panel (**awsm-renderer-kit**), and the **WebAudio player** (`packages/frontend/src/audio.rs`). Sizes the canvas, `transferControlToOffscreen`, and spawns the worker. Forwards input as messages; plays back the worker's audio cues. |
 | **Worker spawn** | `packages/frontend/src/bootstrap.rs` | main | Builds the inline-blob worker and posts it the compiled `WebAssembly.Module` (**not** memory) + the `OffscreenCanvas`. Shared-nothing, so no COOP/COEP. |
-| **Game loop** | `packages/frontend/src/game.rs` | worker | Builds **awsm-renderer** on the `OffscreenCanvas`, loads `scene.toml` via `load_scene_for_player`, derives the collider list (`derive_physics`), and every frame: steps physics, advances the scene's clips, texture flows and particles, **interpolates** each body's pose into the transform arena (after the clips, so physics wins on the bodies it drives), updates the orbit camera, renders, and posts audio cues + sampled stats to main. Applies the input/camera/drop/resize/quality messages it receives. |
+| **Game loop** | `packages/frontend/src/game.rs` | worker | Builds **awsm-renderer** on the `OffscreenCanvas`, loads `scene.toml` via `load_scene_for_player`, derives the collider list (`derive_physics`), and every frame: steps physics, advances the scene's clips, texture flows and particles, **interpolates** each body's pose into the transform arena (after the clips, so physics wins on the bodies it drives), updates the orbit camera, renders, and posts audio cues + the Stats panel's report (~1 Hz) to main. Applies the input/camera/drop messages it receives, and the kit's Settings and stats messages. |
 | **Physics** | `packages/frontend/src/physics.rs` | worker | A **Box3D** `World` built from the scene's colliders (static table + walls, dynamic ball), stepped at a **fixed step** (`SIM_HZ`, 240 Hz default) with wall-clock catch-up. Reads input, keeps a prev/curr pose per body, and emits audio cues from contact/hit events. Box3D runs `workerCount = 1` (its inline serial path). |
 | **Audio** | `packages/frontend/src/audio.rs` | main | Plays the `awsm-audio` export and drives it live from the physics cues (roll / wall-hit / land / ball-clack) the worker posts back. |
 | **Protocol** | `packages/frontend/src/protocol.rs` | both | The message enums (serde) both threads speak, plus the shared constants (`SIM_HZ`, `CAMERA_ORBIT_SENSITIVITY`, the `HELD_*` bits). |
@@ -103,13 +103,13 @@ pose at most once per main frame while it moves), never per-frame render data:
   ───────────                                ─────────────
   DOM key/pointer ──▶ InputMsg / DropMsg ─────────────▶ Input + drop queue
   CameraPose (rAF) ─▶ CameraMsg::Pose ───────────────▶ CameraQueue → OrbitCamera
-  ResizeObserver  ──▶ ResizeMsg  ────────────────────▶ resize the OffscreenCanvas
-  Settings UI     ──▶ QualityMsg ────────────────────▶ pending AA (applied off the render path)
-  Stats groups    ──▶ StatsDetailMsg ────────────────▶ which breakdowns to time
-  WebAudio player ◀── AudioMsg ◀──┐
-  loading / status ◀── RenderMsg ◀┤          game loop, each rAF frame:
-  stats panel     ◀── StatsMsg ◀──┘            drain drops → step World × N (fixed dt)
-                                               → clips + particles → interpolate poses
+  Settings (kit)  ──▶ resize ───────────────────────▶ resize the OffscreenCanvas
+  Settings (kit)  ──▶ anti-alias ───────────────────▶ pending AA (applied off the render path)
+  Stats (kit)     ──▶ stats-view / stats-page ──────▶ the stats collector
+  WebAudio player ◀── AudioMsg ◀─────┐
+  loading / status ◀── RenderMsg ◀────┤      game loop, each rAF frame:
+  Settings (kit)  ◀── aa-compile-* ◀──┤        drain drops → step World × N (fixed dt)
+  stats panel     ◀── stats ◀─────────┘        → clips + particles → interpolate poses
                                                → write arena → render
 ```
 
@@ -222,7 +222,7 @@ events** (contact point + approach speed → position + intensity), so every dro
 thud, rail knock, and ball-on-ball clack is audible; the cap is 200 balls (see
 the rstar note in BOX3D.md).
 
-### Loading screen + stats
+### Loading screen
 
 The loading overlay lives in the static `packages/frontend/index.html` (visible while the wasm
 bundle itself downloads/compiles — "loading code…"), then streams every load
@@ -230,8 +230,42 @@ phase as it happens (streamed from the worker as `RenderMsg::Progress`): device
 creation, the scene fetch, each `awsm-renderer` loader phase
 (materials/meshes/textures/pipelines), the GPU commit stats, and the audio load.
 
-The top-right **Stats** panel (bottom-left **Stats** button;
-`packages/frontend/src/stats.rs`) has one collapsible group per thread, so
+### Settings
+
+The bottom-right **Settings** button opens the graphics controls, both
+applied live and remembered (`localStorage`, prefix `awsm_box3d_st_`):
+
+- **Resolution** (50–100%): the canvas's backing store is its CSS size ×
+  `devicePixelRatio` × this scale, the fill-rate lever. The default is
+  native, capped at a 2.8 MP pixel budget (never below an effective DPR of
+  1), and lower on a touch device (60%) or a software GPU (50%).
+- **Anti-aliasing**: Off, SMAA, MSAA 4×, TAA, and TAA's upscaling presets
+  Quality (67%), Balanced (58%) and Performance (50%), which shade fewer
+  pixels and rebuild the output at the resolution above. TAA is the
+  default on a desktop; a touch device and a software GPU start with Off,
+  and a touch device says so once with a notice. A change recompiles the
+  renderer's pipelines behind a "Compiling Pipelines" overlay the first time
+  (switching between TAA presets compiles nothing).
+
+URL flags: `?reset` forgets the stored settings (and the Stats panel's
+state), `?aa=<id>` (`off`, `smaa`, `msaa`, `taa`, `taa-quality`,
+`taa-balanced`, `taa-performance`) picks a mode for one session without
+storing it. Choices from before TAA (including the pre-0.42
+`awsm_msaa` / `awsm_smaa` keys) carry over.
+
+The Settings and the Stats panel are
+[awsm-renderer-kit](https://github.com/awsm-fun/awsm-renderer-kit)'s
+(`awsm-renderer-settings`, `awsm-renderer-stats`), shared by the awsm
+templates: main shows them, the game worker applies the settings
+(`apply_anti_aliasing`, the canvas resize) and measures the stats. Under
+TAA, the worker resets a ball's motion history when it teleports (the
+fall-through respawn), so the respawned ball does not reproject the history
+of where it fell from.
+
+### Stats
+
+The top-right **Stats** panel (bottom-left **Stats** button) has one
+collapsible group per thread, so
 every number sits under the thread that spent it, with its unit and its basis
 (`/ frame`, `/ step`, `/ s`):
 
@@ -244,13 +278,11 @@ every number sits under the thread that spent it, with its unit and its basis
   add up, except when the CPU waits on the GPU, which shows as missed frames.
   The last row, renderer CPU plus GPU per frame, is a latency figure for
   reference only.
-- **display**: the refresh rate of the browser's frame clock, measured by a
-  `requestAnimationFrame` loop on the (light) main thread since no web API
-  reports it (`packages/frontend/src/refresh.rs`); frames presented per
-  second; and **missed frames**, refreshes that went by with no new frame
-  (with each `StatsMsg` the worker sends how many frames it presented and the
-  time they spanned; a span of `S` ms at refresh period `P` should hold
-  `S / P` frames). Nonzero means the worker is not keeping up with the
+- **display**: the refresh rate of the browser's frame clock, measured from
+  the gaps between the (light) main thread's own `requestAnimationFrame`
+  callbacks since no web API reports it; frames presented per second; and
+  **missed frames**, refreshes that went by with no new frame (a span of `S`
+  ms of presented frames at refresh period `P` should hold `S / P` frames). Nonzero means the worker is not keeping up with the
   display: lower the resolution or the anti-aliasing.
 - **GPU**: GPU time per frame from timestamp queries (`n/a` without
   `timestamp-query`); expanded, one row per pass, slowest first. On Apple
@@ -277,11 +309,17 @@ words; its **About** tab has the controls and a short tour. Both are in
 `packages/frontend/src/about.rs`.
 
 Groups start collapsed and remember their state (`awsm_box3d_st_stats_open_<id>`;
-`?reset` clears it). The worker samples its own counters and posts a smoothed
-`StatsMsg` ~1 Hz. Expanding a group is what turns on its breakdown: main
-posts a `StatsDetailMsg`, and only then does the worker time its phases,
-turn on awsm-renderer's CPU scopes (`SubFrame` on every frame while open,
-`Off` whenever collapsed), or pass on the per-pass GPU times.
+`?reset` clears it). The numbers are measured on the **game worker**, by
+awsm-renderer-stats' collector: every frame it counts the frame's time and
+the renderer's share of it (and, while the renderer group is open, its
+phases), and about once a second it closes a window, adds the physics group
+(`packages/frontend/src/stats.rs`) and posts main one report, which the
+panel only displays. Main sends back which groups are open and, once a
+second, its own frame gaps and work. Expanding a group is what turns on its
+breakdown: the renderer group times the frame's phases and switches
+awsm-renderer's CPU scopes on (`SubFrame` on every frame while open, `Off`
+whenever collapsed), the physics group times each step's phases, and the GPU
+group passes on the per-pass GPU times. A collapsed group costs nothing.
 
 ## The build (why it's plain)
 
@@ -399,10 +437,13 @@ git submodule at `vendor/box3d` and built by the local `packages/box3d-sys` crat
 [Box3D — C physics inside the same wasm module](#box3d--c-physics-inside-the-same-wasm-module)
 and `BOX3D.md` for the integration reference.
 
-All Rust crates are from **crates.io** — `awsm-renderer` family `0.44`,
+All Rust crates are from **crates.io** — `awsm-renderer` family `0.46`,
 `awsm-audio` family `2.5`, `dominator` / `futures-signals`, `glam` `0.32`,
-`libm` (the wasm libc shim's transcendentals) — with **one** exception:
-`dominator` is redirected via `[patch.crates-io]` to an upstream git rev. The
+`libm` (the wasm libc shim's transcendentals) — with **two** exceptions.
+`awsm-renderer-settings` and `awsm-renderer-stats` (the Settings and Stats
+panels) come from the
+[awsm-renderer-kit](https://github.com/awsm-fun/awsm-renderer-kit) git repo,
+pinned to a tag. And `dominator` is redirected via `[patch.crates-io]` to an upstream git rev. The
 published `dominator 0.5.38` does not compile under `web_sys_unstable_apis` (the
 cfg WebGPU needs flips mouse-coord types to `f64`); the patch is the same one the
 awsm-renderer repo uses, and can be dropped once a fixed dominator is released.
